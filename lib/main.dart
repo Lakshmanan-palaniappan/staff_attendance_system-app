@@ -1,18 +1,21 @@
 import 'package:flutter/material.dart';
-import 'screens/splash_screen.dart';
+import '/screens/splash_screen.dart';
 
 void main() {
-  runApp(const AttendanceApp());
+  runApp(const StaffAttendanceApp());
 }
 
-class AttendanceApp extends StatelessWidget {
-  const AttendanceApp({super.key});
+class StaffAttendanceApp extends StatelessWidget {
+  const StaffAttendanceApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: "Staff Attendance",
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(primarySwatch: Colors.blue),
+      theme: ThemeData(
+        primarySwatch: Colors.indigo,
+      ),
       home: const SplashScreen(),
     );
   }

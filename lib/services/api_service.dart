@@ -1,43 +1,37 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
-
 const String backendBaseUrl = "http://103.207.1.87:3030";
+
 class ApiService {
-  /// 🔐 REQUEST LOGIN APPROVAL
-  /// Sends a login request — admin must approve before the user can proceed
-  
-  static Future<Map<String, dynamic>> loginRequest(String usernameOrId, String password) async {
+  /// POST /auth/login-request
+  static Future<Map<String, dynamic>> loginRequest(
+      String username, String password) async {
     final res = await http.post(
       Uri.parse("$backendBaseUrl/auth/login-request"),
       headers: {"Content-Type": "application/json"},
       body: jsonEncode({
-        "usernameOrId": usernameOrId.trim(),
+        "usernameOrId": username.trim(),
         "password": password.trim(),
       }),
     );
     return _handleResponse(res);
   }
 
-  /// 🧾 REGISTER NEW STAFF
-  /// Creates a new staff account (immediately redirected to login screen)
-  static Future<Map<String, dynamic>> register(
-      String name, String username, String password, String idCardNumber) async {
-    final res = await http.post(
-      Uri.parse("$backendBaseUrl/auth/register"),
+  /// GET /auth/check-status/:staffId
+  static Future<String> checkLoginStatus(int staffId) async {
+    final res = await http.get(
+      Uri.parse("$backendBaseUrl/auth/check-status/$staffId"),
       headers: {"Content-Type": "application/json"},
-      body: jsonEncode({
-        "name": name.trim(),
-        "username": username.trim(),
-        "password": password.trim(),
-        "idCardNumber": idCardNumber.trim(),
-      }),
     );
-    return _handleResponse(res);
+    final data = jsonDecode(res.body);
+    if (res.statusCode == 200) return data["status"];
+    throw Exception(data["error"] ?? "Failed to get status");
   }
 
-  /// 📍 MARK ATTENDANCE (check-in or check-out based on backend logic)
-  static Future<Map<String, dynamic>> markAttendance(int staffId, double lat, double lng) async {
+  /// POST /attendance/mark
+  static Future<Map<String, dynamic>> markAttendance(
+      int staffId, double lat, double lng) async {
     final res = await http.post(
       Uri.parse("$backendBaseUrl/attendance/mark"),
       headers: {"Content-Type": "application/json"},
@@ -50,37 +44,27 @@ class ApiService {
     return _handleResponse(res);
   }
 
-  /// 📅 GET TODAY'S ATTENDANCE RECORDS
+  /// GET /staff/attendance/today/:staffId
   static Future<List<dynamic>> getTodayAttendance(int staffId) async {
     final res = await http.get(
-      Uri.parse("$backendBaseUrl/attendance/today/$staffId"),
+      Uri.parse("$backendBaseUrl/staff/attendance/today/$staffId"),
       headers: {"Content-Type": "application/json"},
     );
-    if (res.statusCode == 200) {
-      return jsonDecode(res.body);
-    } else {
-      throw Exception("Failed to load today's attendance");
-    }
+    if (res.statusCode == 200) return jsonDecode(res.body);
+    throw Exception("Failed to load attendance");
   }
 
-  /// 👤 GET STAFF DETAILS (by staffId)
-  /// 👤 GET STAFF DETAILS (by staffId)
-static Future<Map<String, dynamic>> getStaffDetails(int staffId) async {
-  final res = await http.get(
-    Uri.parse("$backendBaseUrl/staff/$staffId"),
-    headers: {"Content-Type": "application/json"},
-  );
-
-  final data = jsonDecode(res.body);
-  if (res.statusCode == 200) {
-    return Map<String, dynamic>.from(data);
-  } else {
-    throw Exception(data["error"] ?? "Failed to load staff details");
+  /// GET /staff/me/:staffId
+  static Future<Map<String, dynamic>> getMyProfile(int staffId) async {
+    final res = await http.get(
+      Uri.parse("$backendBaseUrl/staff/me/$staffId"),
+      headers: {"Content-Type": "application/json"},
+    );
+    final data = jsonDecode(res.body);
+    if (res.statusCode == 200) return data;
+    throw Exception(data["error"] ?? "Failed to load profile");
   }
-}
 
-
-  /// ⚙️ Common response handler
   static Map<String, dynamic> _handleResponse(http.Response res) {
     final data = jsonDecode(res.body);
     if (res.statusCode >= 200 && res.statusCode < 300) {
@@ -89,21 +73,28 @@ static Future<Map<String, dynamic>> getStaffDetails(int staffId) async {
       throw Exception(data["error"] ?? "Something went wrong");
     }
   }
+  /// GET /staff/attendance/pairs/:staffId
+  static Future<List<dynamic>> getAttendancePairs(int staffId) async {
+    final res = await http.get(
+      Uri.parse("$backendBaseUrl/staff/attendance/pairs/$staffId"),
+      headers: {"Content-Type": "application/json"},
+    );
+
+    if (res.statusCode == 200) return jsonDecode(res.body);
+    throw Exception("Failed to load attendance pairs");
+  }
+
+  /// GET /staff/attendance/all/:staffId
+  static Future<List<dynamic>> getAttendanceAll(int staffId) async {
+    final res = await http.get(
+      Uri.parse("$backendBaseUrl/staff/attendance/all/$staffId"),
+      headers: {"Content-Type": "application/json"},
+    );
+
+    if (res.statusCode == 200) return jsonDecode(res.body);
+    throw Exception("Failed to load full attendance");
+  }
+
 }
 
 
-// static Future<Map<String, dynamic>> getStaffDetails({int? staffId, String? usernameOrId}) async {
-// String url = "$backendBaseUrl/staff";
-// if (staffId != null) {
-// url += "/$staffId";
-// } else if (usernameOrId != null) {
-// url += "?usernameOrId=$usernameOrId";
-// } else {
-// throw Exception("Provide staffId or usernameOrId");
-// }
-//
-// final res = await http.get(Uri.parse(url), headers: {"Content-Type": "application/json"});
-// final data = jsonDecode(res.body);
-// if (res.statusCode == 200) return data;
-// throw Exception(data["error"] ?? "Failed to fetch staff details");
-// }

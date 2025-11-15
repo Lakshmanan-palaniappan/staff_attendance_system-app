@@ -1,41 +1,102 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:vibration/vibration.dart';
 import '../services/api_service.dart';
 import 'attendance_home.dart';
 
-class LoginRegisterScreen extends StatefulWidget {
-  const LoginRegisterScreen({super.key});
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
 
   @override
-  State<LoginRegisterScreen> createState() => _LoginRegisterScreenState();
+  State<LoginScreen> createState() => _LoginScreenState();
 }
 
-class _LoginRegisterScreenState extends State<LoginRegisterScreen> {
-  bool isLogin = true;
-  bool isLoading = false;
+class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _nameController = TextEditingController();
-  final _usernameController = TextEditingController();
-  final _idCardController = TextEditingController();
-  final _passwordController = TextEditingController();
-  String status = "";
-  IO.Socket? socket;
 
-  Future<void> _connectSocket(int staffId) async {
-    socket = IO.io(backendBaseUrl, IO.OptionBuilder().setTransports(['websocket']).build());
-    socket!.onConnect((_) {
-      socket!.emit("register_staff_socket", staffId);
-    });
-    socket!.on("login_approved", (_) async {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setInt("staffId", staffId);
-      if (mounted) {
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const AttendanceHome()));
-      }
+  final _usernameController = TextEditingController();
+  final _passwordController = TextEditingController();
+
+  bool isLoading = false;
+  bool _obscurePass = true;
+  String status = "";
+  int? pendingStaffId;
+  Timer? pollTimer;
+
+  String _cleanError(e) =>
+      e.toString().replaceFirst("Exception:", "").trim();
+
+  Future<void> _vibrate({bool error = false}) async {
+    if (await Vibration.hasVibrator() ?? false) {
+      await Vibration.vibrate(duration: error ? 200 : 60);
+    }
+  }
+
+  void _snack(String msg, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg, textAlign: TextAlign.center),
+        backgroundColor: error ? Colors.red.shade600 : Colors.green.shade600,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    pollTimer?.cancel();
+    _usernameController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  // -----------------------------------------------------------
+  // Polling Login Status
+  // -----------------------------------------------------------
+  void _startPolling() {
+    pollTimer?.cancel();
+    if (pendingStaffId == null) return;
+
+    pollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _checkStatusManual();
     });
   }
 
+  // -----------------------------------------------------------
+  // Manual refresh button → Check login request status
+  // -----------------------------------------------------------
+  Future<void> _checkStatusManual() async {
+    if (pendingStaffId == null) return;
+
+    try {
+      final statusResp = await ApiService.checkLoginStatus(pendingStaffId!);
+      setState(() => status = "Status: $statusResp");
+
+      if (statusResp == "Approved") {
+        pollTimer?.cancel();
+
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setInt("staffId", pendingStaffId!);
+
+        await _vibrate();
+        if (!mounted) return;
+        _snack("Login approved!");
+
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (_) => const AttendanceHome()),
+        );
+      }
+    } catch (e) {
+      setState(() => status = _cleanError(e));
+    }
+  }
+
+  // -----------------------------------------------------------
+  // Submit Login Request
+  // -----------------------------------------------------------
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
 
@@ -45,125 +106,164 @@ class _LoginRegisterScreenState extends State<LoginRegisterScreen> {
     });
 
     try {
-      if (isLogin) {
-        final res = await ApiService.loginRequest(
-          _usernameController.text,
-          _passwordController.text,
-        );
+      final usernameClean =
+      _usernameController.text.trim().replaceAll(" ", "");
 
-        setState(() => status = res["message"] ?? "Waiting for admin approval...");
+      final res = await ApiService.loginRequest(
+        usernameClean,
+        _passwordController.text.trim(),
+      );
 
-        if (res["staffId"] != null) {
-          await _connectSocket(res["staffId"]);
-        }
-      } else {
-        final res = await ApiService.register(
-          _nameController.text,
-          _usernameController.text,
-          _passwordController.text,
-          _idCardController.text,
-        );
-
-        setState(() {
-          status = res["message"] ?? "Registered successfully!";
-          isLogin = true;
-        });
+      pendingStaffId = int.tryParse(res["staffId"].toString());
+      if (pendingStaffId == null) {
+        throw Exception("Invalid staff ID returned from server");
       }
+
+      status = res["message"] ?? "Login request sent";
+
+      _snack("Waiting for admin approval…");
+      _startPolling();
     } catch (e) {
-      setState(() => status = e.toString());
+      final msg = _cleanError(e);
+      await _vibrate(error: true);
+      _snack(msg, error: true);
+      setState(() => status = msg);
     } finally {
       setState(() => isLoading = false);
     }
   }
 
-  @override
-  void dispose() {
-    socket?.dispose();
-    super.dispose();
-  }
-
-  String? _validateRequired(String? v) => v == null || v.isEmpty ? "Required" : null;
-  String? _validatePassword(String? v) => v != null && v.length < 6 ? "Min 6 chars" : null;
-
+  // -----------------------------------------------------------
+  // UI
+  // -----------------------------------------------------------
   @override
   Widget build(BuildContext context) {
+    final width = MediaQuery.of(context).size.width;
+    final isWide = width > 560;
+
     return Scaffold(
-      appBar: AppBar(title: Text(isLogin ? "Login" : "Register")),
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 400),
-            child: Form(
-              key: _formKey,
-              child: Column(
-                children: [
-                  Text(
-                    isLogin ? "Welcome Back!" : "Create an Account",
-                    style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+      resizeToAvoidBottomInset: true,   // ⭐ Prevent overflow with keyboard
+      appBar: AppBar(title: const Text("Login")),
+      body: SafeArea(
+        child: SingleChildScrollView(   // ⭐ Allows scrolling when keyboard opens
+          padding: EdgeInsets.all(isWide ? 24 : 16),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 520),
+              child: Card(
+                elevation: 5,
+                clipBehavior: Clip.antiAlias,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16)),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: isWide ? 28 : 20,
+                    vertical: 25,
                   ),
-                  const SizedBox(height: 20),
-                  if (!isLogin)
-                    TextFormField(
-                      controller: _nameController,
-                      decoration: const InputDecoration(labelText: "Full Name", hintText: "John Doe"),
-                      validator: _validateRequired,
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text(
+                          "Staff Login",
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              fontSize: 24, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 20),
+
+                        // Username
+                        TextFormField(
+                          controller: _usernameController,
+                          decoration: const InputDecoration(
+                            labelText: "Username",
+                            border: OutlineInputBorder(),
+                          ),
+                          validator: (v) =>
+                          v == null || v.trim().isEmpty ? "Required" : null,
+                        ),
+                        const SizedBox(height: 12),
+
+                        // Password
+                        TextFormField(
+                          controller: _passwordController,
+                          obscureText: _obscurePass,
+                          decoration: InputDecoration(
+                            labelText: "Password",
+                            border: const OutlineInputBorder(),
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                _obscurePass
+                                    ? Icons.visibility
+                                    : Icons.visibility_off,
+                              ),
+                              onPressed: () =>
+                                  setState(() => _obscurePass = !_obscurePass),
+                            ),
+                          ),
+                          validator: (v) =>
+                          v == null || v.trim().isEmpty ? "Required" : null,
+                        ),
+                        const SizedBox(height: 20),
+
+                        // Login Button
+                        SizedBox(
+                          height: 50,
+                          child: ElevatedButton(
+                            onPressed: isLoading ? null : _submit,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.indigo,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            child: isLoading
+                                ? const SizedBox(
+                                height: 22,
+                                width: 22,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2, color: Colors.white))
+                                : const Text(
+                              "Login",
+                              style: TextStyle(
+                                  fontSize: 16, color: Colors.white),
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        // Refresh Status Button
+                        if (pendingStaffId != null)
+                          SizedBox(
+                            height: 45,
+                            child: OutlinedButton.icon(
+                              icon: const Icon(Icons.refresh),
+                              label: const Text("Refresh Status"),
+                              style: OutlinedButton.styleFrom(
+                                side: const BorderSide(color: Colors.indigo),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                              onPressed: _checkStatusManual,
+                            ),
+                          ),
+
+                        if (status.isNotEmpty) const SizedBox(height: 12),
+
+                        if (status.isNotEmpty)
+                          Text(
+                            status,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(fontSize: 14),
+                          ),
+                      ],
                     ),
-                  TextFormField(
-                    controller: _usernameController,
-                    decoration: InputDecoration(
-                      labelText: isLogin ? "Username / ID Card" : "Username",
-                      hintText: isLogin ? "Enter your username or ID" : "Choose a username",
-                    ),
-                    validator: _validateRequired,
                   ),
-                  if (!isLogin)
-                    TextFormField(
-                      controller: _idCardController,
-                      decoration: const InputDecoration(labelText: "ID Card Number", hintText: "e.g. 12345"),
-                      validator: _validateRequired,
-                    ),
-                  TextFormField(
-                    controller: _passwordController,
-                    obscureText: true,
-                    decoration: const InputDecoration(labelText: "Password", hintText: "At least 6 characters"),
-                    validator: _validatePassword,
-                  ),
-                  const SizedBox(height: 20),
-                  ElevatedButton(
-                    onPressed: isLoading ? null : _submit,
-                    style: ElevatedButton.styleFrom(
-                      minimumSize: const Size(double.infinity, 48),
-                      backgroundColor: Colors.indigo,
-                    ),
-                    child: isLoading
-                        ? const SizedBox(
-                      height: 24,
-                      width: 24,
-                      child: CircularProgressIndicator(color: Colors.white, strokeWidth: 3),
-                    )
-                        : Text(isLogin ? "Login" : "Register", style: const TextStyle(fontSize: 16)),
-                  ),
-                  const SizedBox(height: 12),
-                  TextButton(
-                    onPressed: () => setState(() {
-                      isLogin = !isLogin;
-                      status = "";
-                    }),
-                    child: Text(isLogin
-                        ? "Don't have an account? Register"
-                        : "Already registered? Login"),
-                  ),
-                  if (status.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 16),
-                      child: Text(
-                        status,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w500),
-                      ),
-                    ),
-                ],
+                ),
               ),
             ),
           ),
@@ -171,4 +271,5 @@ class _LoginRegisterScreenState extends State<LoginRegisterScreen> {
       ),
     );
   }
+
 }

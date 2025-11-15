@@ -2,10 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vibration/vibration.dart';
+
 import '../services/api_service.dart';
 import '../widgets/attendance_toggle.dart';
 import 'login_screen.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
 
 class AttendanceHome extends StatefulWidget {
   const AttendanceHome({super.key});
@@ -17,95 +18,152 @@ class AttendanceHome extends StatefulWidget {
 class _AttendanceHomeState extends State<AttendanceHome> {
   bool isCheckedIn = false;
   bool isLoading = false;
-  String status = "Initializing...";
+
+  String status = "Loading...";
+  String lastUpdated = "-";
+
   int? staffId;
-  String name = "";
-  String idCard = "";
-  List<dynamic> records = [];
-  IO.Socket? socket;
-  Timer? _longPressTimer;
+  String displayName = "";
+  String displayId = "";
+
+  List<dynamic> today = [];
+  List<dynamic> pairs = [];
+  List<dynamic> history = [];
+
+  // Utility
+  String _clean(e) => e.toString().replaceFirst("Exception:", "").trim();
+
+  Future<void> _vibrate({bool error = false}) async {
+    if (await Vibration.hasVibrator() ?? false) {
+      await Vibration.vibrate(duration: error ? 200 : 80);
+    }
+  }
+
+  void _snack(String msg, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: error ? Colors.red : Colors.green,
+      ),
+    );
+  }
 
   @override
   void initState() {
     super.initState();
-    _loadUser();
+    _initLoad();
   }
 
-  Future<void> _loadUser() async {
+  Future<void> _initLoad() async {
     final prefs = await SharedPreferences.getInstance();
     staffId = prefs.getInt("staffId");
-    if (staffId != null) {
-      _connectSocket();
-      await _loadStaffDetails();
-      await _refreshAttendance();
-    } else {
-      setState(() => status = "⚠️ No staff ID found. Please login again.");
+
+    if (staffId == null) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+      );
+      return;
     }
+
+    await _loadProfile();
+    await _refreshAll();
   }
 
-  void _connectSocket() {
-    socket = IO.io(backendBaseUrl,
-        IO.OptionBuilder().setTransports(['websocket']).build());
-    socket!.emit("register_staff_socket", staffId);
-    socket!.on("login_approved", (data) {
-      setState(() {
-        status = "✅ Login Approved! You can mark attendance now.";
-      });
-    });
-  }
-
-  Future<void> _loadStaffDetails() async {
+  Future<void> _loadProfile() async {
     try {
-      final staff = await ApiService.getStaffDetails(staffId!);
+      final data = await ApiService.getMyProfile(staffId!);
+
       setState(() {
-        name = staff["Name"] ?? "";
-        idCard = staff["IdCardNumber"] ?? "";
+        displayName = data["username"] ?? "Staff";
+        displayId = (data["staffId"] ?? "").toString();
       });
     } catch (e) {
-      setState(() => status = "Failed to load staff details: $e");
+      _snack(_clean(e), error: true);
     }
   }
 
-  Future<void> _refreshAttendance() async {
-    try {
-      final data = await ApiService.getTodayAttendance(staffId!);
-      setState(() {
-        records = data;
-        if (records.isNotEmpty) {
-          isCheckedIn = records.first["CheckType"].toLowerCase() == "checkin";
-        }
-      });
-    } catch (e) {
-      setState(() => status = "Error fetching attendance: $e");
-    }
+  Future<void> _refreshAll() async {
+    await _loadToday();
+    await _loadPairs();
+    await _loadHistory();
   }
 
-  Future<void> _markAttendance() async {
-    setState(() {
-      isLoading = true;
-      status = "📍 Scanning your location...";
-    });
-
+  // ========================== LOAD TODAY ==========================
+  Future<void> _loadToday() async {
     try {
-      final permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        setState(() => status = "❌ Location permission denied");
-        return;
+      today = await ApiService.getTodayAttendance(staffId!);
+
+      if (today.isNotEmpty) {
+        isCheckedIn = today.first["CheckType"].toLowerCase() == "checkin";
+        status = isCheckedIn ? "Checked In" : "Not Checked In";
+      } else {
+        isCheckedIn = false;
+        status = "No check-in yet";
       }
 
-      final pos =
-          await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
-      final res =
-          await ApiService.markAttendance(staffId!, pos.latitude, pos.longitude);
-
-      setState(() {
-        isCheckedIn = res["currentStatus"] == "checkin";
-        status = res["message"];
-      });
-      await _refreshAttendance();
+      setState(() {});
     } catch (e) {
-      setState(() => status = "Error: $e");
+      _snack(_clean(e), error: true);
+    }
+  }
+
+  // ========================== LOAD WORK HOURS ==========================
+  Future<void> _loadPairs() async {
+    try {
+      pairs = await ApiService.getAttendancePairs(staffId!);
+      setState(() {});
+    } catch (e) {
+      _snack(_clean(e), error: true);
+    }
+  }
+
+  // ========================== LOAD FULL HISTORY ==========================
+  Future<void> _loadHistory() async {
+    try {
+      history = await ApiService.getAttendanceAll(staffId!);
+      setState(() {});
+    } catch (e) {
+      _snack(_clean(e), error: true);
+    }
+  }
+
+  // ========================== MARK ATTENDANCE ==========================
+  Future<void> _manualMark() async {
+    setState(() {
+      isLoading = true;
+      status = "Getting location…";
+    });
+
+    try {
+      LocationPermission perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied) {
+        throw Exception("Location permission denied");
+      }
+
+      final pos = await Geolocator.getCurrentPosition();
+
+      final res = await ApiService.markAttendance(
+        staffId!,
+        pos.latitude,
+        pos.longitude,
+      );
+
+      status = res["message"];
+      lastUpdated = TimeOfDay.now().format(context);
+
+      await _refreshAll();
+      await _vibrate();
+      _snack(status);
+    } catch (e) {
+      final msg = _clean(e);
+      await _vibrate(error: true);
+      _snack(msg, error: true);
+      status = msg;
     } finally {
       setState(() => isLoading = false);
     }
@@ -114,142 +172,349 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   Future<void> _logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
-    if (mounted) {
-      Navigator.pushReplacement(
-          context, MaterialPageRoute(builder: (_) => const LoginRegisterScreen()));
-    }
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+    );
   }
 
-  void _startLogoutTimer() {
-    _longPressTimer = Timer(const Duration(seconds: 5), () => _logout());
-  }
-
-  void _cancelLogoutTimer() {
-    _longPressTimer?.cancel();
-  }
-
+  // ========================== UI ==========================
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Attendance")),
+      appBar: AppBar(title: const Text("My Attendance")),
       drawer: Drawer(
         child: ListView(
           children: [
             UserAccountsDrawerHeader(
-              accountName: Text(name.isEmpty ? "Staff Member" : name),
-              accountEmail: Text("ID: $idCard"),
+              accountName: Text(displayName),
+              accountEmail: Text("ID: $displayId"),
               currentAccountPicture: const CircleAvatar(
-                backgroundColor: Colors.white,
-                child: Icon(Icons.person, color: Colors.indigo),
+                child: Icon(Icons.person, color: Colors.white),
               ),
             ),
             ListTile(
               leading: const Icon(Icons.logout),
               title: const Text("Logout"),
               onTap: _logout,
+            )
+          ],
+        ),
+      ),
+
+      body: Stack(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                Expanded(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _profileCard(),
+                        const SizedBox(height: 20),
+
+                        AttendanceToggle(
+                          isCheckedIn: isCheckedIn,
+                          isLoading: isLoading,
+                          onPressed: _manualMark,
+                        ),
+
+                        const SizedBox(height: 20),
+                        _todaySummaryCard(),
+
+                        const SizedBox(height: 12),
+                        _workHoursCard(),
+
+                        const SizedBox(height: 12),
+                        _fullHistoryList(),   // ❗ Removed Expanded here
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          if (isLoading)
+            Container(
+              color: Colors.black26,
+              child: const Center(
+                child: CircularProgressIndicator(strokeWidth: 4),
+              ),
+            ),
+        ],
+      ),
+
+    );
+  }
+
+  // ======================= CARD: PROFILE =======================
+  Widget _profileCard() {
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 28,
+              backgroundColor: isCheckedIn ? Colors.green : Colors.indigo,
+              child: const Icon(Icons.person, color: Colors.white),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(displayName,
+                      style: const TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.bold)),
+                  Text("ID: $displayId"),
+                  const SizedBox(height: 6),
+                  Text("Status: $status"),
+                  Text("Last Updated: $lastUpdated"),
+                ],
+              ),
             ),
           ],
         ),
       ),
-      body: GestureDetector(
-        onLongPressStart: (_) => _startLogoutTimer(),
-        onLongPressEnd: (_) => _cancelLogoutTimer(),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              _staffCard(),
-              const SizedBox(height: 20),
-              AttendanceToggle(
-                isCheckedIn: isCheckedIn,
-                isLoading: isLoading,
-                onPressed: _markAttendance,
-              ),
-              const SizedBox(height: 20),
-              const Divider(),
-              const Text("Today's Attendance",
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 10),
-              Expanded(
-                child: records.isEmpty
-                    ? const Center(child: Text("No attendance records today"))
-                    : ListView.builder(
-                        itemCount: records.length,
-                        itemBuilder: (_, i) {
-                          final r = records[i];
-                          return ListTile(
-                            leading: Icon(
-                              r["CheckType"].toLowerCase() == "checkin"
-                                  ? Icons.login
-                                  : Icons.logout,
-                              color: r["CheckType"].toLowerCase() == "checkin"
-                                  ? Colors.green
-                                  : Colors.red,
-                            ),
-                            title: Text(r["CheckType"]),
-                            subtitle: Text("Time: ${r["Timestamp"] ?? ''}"),
-                          );
-                        },
-                      ),
-              ),
-            ],
-          ),
+    );
+  }
+
+  // ======================= CARD: TODAY SUMMARY =======================
+  Widget _todaySummaryCard() {
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("Today's Logs",
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+
+            if (today.isEmpty)
+              const Text("No records yet"),
+
+            ...today.map((r) {
+              return ListTile(
+                leading: Icon(
+                  r["CheckType"] == "checkin"
+                      ? Icons.login
+                      : Icons.logout,
+                  color: r["CheckType"] == "checkin"
+                      ? Colors.green
+                      : Colors.red,
+                ),
+                title: Text(r["CheckType"].toUpperCase()),
+                subtitle: Text(r["Timestamp"]),
+              );
+            })
+          ],
         ),
       ),
     );
   }
 
-  Widget _staffCard() {
-    final bgColor = isCheckedIn ? Colors.green.shade100 : Colors.grey.shade200;
+  // ======================= CARD: WORK HOURS =======================
+  // ======================= CARD: WORK HOURS (With Date Chips) =======================
+  Widget _workHoursCard() {
+    if (pairs.isEmpty) {
+      return Card(
+        elevation: 3,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        child: const Padding(
+          padding: EdgeInsets.all(14),
+          child: Text("No work hours recorded yet"),
+        ),
+      );
+    }
 
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 400),
-      decoration: BoxDecoration(
-        color: bgColor,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: const [
-          BoxShadow(
-              color: Colors.black12, blurRadius: 6, offset: Offset(0, 3)),
-        ],
-      ),
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const CircleAvatar(
-                radius: 28,
-                backgroundColor: Colors.indigo,
-                child: Icon(Icons.person, color: Colors.white, size: 32),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(name.isNotEmpty ? name : "Loading...",
-                        style: const TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
-                    Text("ID Card: ${idCard.isNotEmpty ? idCard : 'Fetching...'}",
-                        style: const TextStyle(color: Colors.black54)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          const Divider(),
-          Text(
-            "Status: $status",
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: isCheckedIn ? Colors.green.shade800 : Colors.grey.shade800,
+    /// 1️⃣ Group by date
+    Map<String, List<dynamic>> grouped = {};
+
+    for (var p in pairs) {
+      String date = p["Date"] ?? "--";
+      grouped.putIfAbsent(date, () => []);
+      grouped[date]!.add(p);
+    }
+
+    Duration grandTotal = Duration.zero;
+
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              "Work Hours",
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
-          ),
-        ],
+            const SizedBox(height: 16),
+
+            /// 🔥 2️⃣ Chip List for all dates
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: grouped.keys.map((date) {
+                return Chip(
+                  label: Text(
+                    date,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  avatar: const Icon(Icons.calendar_today, size: 18),
+                  backgroundColor: Colors.indigo.shade50,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                );
+              }).toList(),
+            ),
+
+            const SizedBox(height: 16),
+            const Divider(),
+            const SizedBox(height: 10),
+
+            /// 🔥 3️⃣ Build logs for each date
+            ...grouped.entries.map((entry) {
+              String date = entry.key;
+              List<dynamic> logs = entry.value;
+
+              Duration totalForDay = Duration.zero;
+              List<Widget> logWidgets = [];
+
+              for (var row in logs) {
+                DateTime? ci = row["CheckInTime"] != null
+                    ? DateTime.parse(row["CheckInTime"])
+                    : null;
+
+                DateTime? co = row["CheckOutTime"] != null
+                    ? DateTime.parse(row["CheckOutTime"])
+                    : null;
+
+                Duration diff = Duration.zero;
+                if (ci != null && co != null) {
+                  diff = co.difference(ci);
+                  totalForDay += diff;
+                  grandTotal += diff;
+                }
+
+                String worked = (ci != null && co != null)
+                    ? "${diff.inHours}h ${diff.inMinutes % 60}m"
+                    : "—";
+
+                logWidgets.add(
+                  ListTile(
+                    leading: const Icon(Icons.access_time),
+                    title: Text("Check-in: ${row["CheckInTime"] ?? "-"}"),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text("Check-out: ${row["CheckOutTime"] ?? "-"}"),
+                        Text("Worked: $worked"),
+                      ],
+                    ),
+                  ),
+                );
+              }
+
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 10),
+
+                  /// 🔥 DATE HEADING
+                  Text(
+                    date,
+                    style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.indigo),
+                  ),
+                  const SizedBox(height: 6),
+
+                  ...logWidgets,
+
+                  Padding(
+                    padding: const EdgeInsets.only(left: 12, bottom: 10),
+                    child: Text(
+                      "Daily Total: ${totalForDay.inHours}h ${totalForDay.inMinutes % 60}m",
+                      style: const TextStyle(
+                          fontWeight: FontWeight.bold, color: Colors.green),
+                    ),
+                  ),
+
+                  const Divider(),
+                ],
+              );
+            }).toList(),
+
+            const SizedBox(height: 12),
+
+            /// 🔥 GRAND TOTAL
+            Text(
+              "GRAND TOTAL: ${grandTotal.inHours}h ${grandTotal.inMinutes % 60}m",
+              style: const TextStyle(
+                  fontSize: 17, fontWeight: FontWeight.bold, color: Colors.black),
+            ),
+          ],
+        ),
       ),
     );
   }
+
+
+
+  // ======================= FULL HISTORY LIST =======================
+  Widget _fullHistoryList() {
+    return Card(
+      elevation: 3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("Full Attendance History",
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+
+            SizedBox(
+              height: 300,   // 🔥 Fixed height so ListView can render safely
+              child: history.isEmpty
+                  ? const Center(child: Text("No history found"))
+                  : ListView.builder(
+                itemCount: history.length,
+                itemBuilder: (_, i) {
+                  final r = history[i];
+                  return ListTile(
+                    leading: Icon(
+                      r["CheckType"] == "checkin"
+                          ? Icons.login
+                          : Icons.logout,
+                      color: r["CheckType"] == "checkin"
+                          ? Colors.green
+                          : Colors.red,
+                    ),
+                    title: Text(r["CheckType"]),
+                    subtitle: Text(r["Timestamp"]),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
 }
