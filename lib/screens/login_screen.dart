@@ -2,9 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
+
 import '../services/api_service.dart';
-import 'attendance_home.dart';
 import '../services/version_service.dart';
+import 'attendance_home.dart';
+import 'update_required_screen.dart';  // ⬅️ import the update screen
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -110,7 +112,7 @@ class _LoginScreenState extends State<LoginScreen> {
       final usernameClean =
       _usernameController.text.trim().replaceAll(" ", "");
 
-      // NEW: get current app version
+      // Get current app version
       final appVersion = await VersionService.getCurrentVersion();
 
       final res = await ApiService.loginRequest(
@@ -131,26 +133,50 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (e) {
       final msg = _cleanError(e);
 
-      // If backend signalled outdated app
+      // ---------- OUTDATED APP HANDLING ----------
       if (msg.contains("OUTDATED_APP") ||
           msg.toLowerCase().contains("outdated")) {
+        await _vibrate(error: true);
         _snack(
-          "Your app is outdated. Please update from Play Store / latest APK.",
+          "Your app is outdated. Please update to continue.",
           error: true,
         );
-        setState(() {
-          status = "App version is outdated. Please update.";
-        });
-      } else {
-        await _vibrate(error: true);
-        _snack(msg, error: true);
-        setState(() => status = msg);
+
+        // Get current + latest version for update screen
+        final currentVersion = await VersionService.getCurrentVersion();
+        String latestVersion = "Unknown";
+
+        try {
+          latestVersion = await ApiService.fetchLatestAppVersion();
+        } catch (_) {
+          // ignore, keep "Unknown"
+        }
+
+        if (!mounted) return;
+
+        // Navigate to the dedicated update screen
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => UpdateRequiredScreen(
+              currentVersion: currentVersion,
+              latestVersion: latestVersion,
+            ),
+          ),
+        );
+        return; // stop further error handling
       }
+      // -------------------------------------------
+
+      await _vibrate(error: true);
+      _snack(msg, error: true);
+      setState(() => status = msg);
     } finally {
-      setState(() => isLoading = false);
+      if (mounted) {
+        setState(() => isLoading = false);
+      }
     }
   }
-
 
   // -----------------------------------------------------------
   // UI
@@ -161,10 +187,10 @@ class _LoginScreenState extends State<LoginScreen> {
     final isWide = width > 560;
 
     return Scaffold(
-      resizeToAvoidBottomInset: true,   // ⭐ Prevent overflow with keyboard
+      resizeToAvoidBottomInset: true, // prevent overflow with keyboard
       appBar: AppBar(title: const Text("Login")),
       body: SafeArea(
-        child: SingleChildScrollView(   // ⭐ Allows scrolling when keyboard opens
+        child: SingleChildScrollView(
           padding: EdgeInsets.all(isWide ? 24 : 16),
           child: Center(
             child: ConstrainedBox(
@@ -240,14 +266,19 @@ class _LoginScreenState extends State<LoginScreen> {
                             ),
                             child: isLoading
                                 ? const SizedBox(
-                                height: 22,
-                                width: 22,
-                                child: CircularProgressIndicator(
-                                    strokeWidth: 2, color: Colors.white))
+                              height: 22,
+                              width: 22,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
                                 : const Text(
                               "Login",
                               style: TextStyle(
-                                  fontSize: 16, color: Colors.white),
+                                fontSize: 16,
+                                color: Colors.white,
+                              ),
                             ),
                           ),
                         ),
@@ -290,5 +321,4 @@ class _LoginScreenState extends State<LoginScreen> {
       ),
     );
   }
-
 }
