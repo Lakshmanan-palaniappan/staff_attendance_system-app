@@ -8,11 +8,12 @@
 
     <application
 
-        android:label="staff_attendace_system"
+
+        android:label="E-Attendance"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"
-    android:networkSecurityConfig="@xml/network_security_config">
+        android:networkSecurityConfig="@xml/network_security_config">
         <service android:name="com.pravera.geofence_service.GeofenceService" android:exported="false" />
 
         <activity
@@ -43,6 +44,7 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
+
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
@@ -55,4 +57,15 @@
             <data android:mimeType="text/plain"/>
         </intent>
     </queries>
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="http"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:scheme="https"/>
+        </intent>
+    </queries>
+
 </manifest>

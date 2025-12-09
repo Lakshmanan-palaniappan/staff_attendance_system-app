@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class UpdateRequiredScreen extends StatelessWidget {
   final String currentVersion;
@@ -9,6 +10,39 @@ class UpdateRequiredScreen extends StatelessWidget {
     required this.currentVersion,
     required this.latestVersion,
   });
+
+  Future<void> _openUpdateLink(BuildContext context) async {
+    final Uri url = Uri.parse(
+      "https://drive.google.com/drive/folders/1Ub4C8fM8XUz6h4X1feSDLJqRWE1jG0Jh?usp=sharing",
+    );
+
+    try {
+      // 1️⃣ Try opening in external app (browser / Drive)
+      bool launched = await launchUrl(
+        url,
+        mode: LaunchMode.externalApplication,
+      );
+
+      // 2️⃣ Fallback: open inside app using browser view (Chrome Custom Tab / in-app browser)
+      if (!launched) {
+        launched = await launchUrl(
+          url,
+          mode: LaunchMode.inAppBrowserView,
+        );
+      }
+
+      // 3️⃣ If still not launched, show error
+      if (!launched) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Unable to open update link.")),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Error opening link: $e")),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -33,10 +67,7 @@ class UpdateRequiredScreen extends StatelessWidget {
             ),
             const SizedBox(height: 24),
             ElevatedButton(
-              onPressed: () {
-                // TODO: Open Play Store / download URL
-                // e.g. launchUrl(Uri.parse("https://play.google.com/store/apps/details?id=your.package"));
-              },
+              onPressed: () => _openUpdateLink(context),
               child: const Text("Update Now"),
             ),
           ],
