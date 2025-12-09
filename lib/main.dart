@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:staff_attendace_system/services/version_check.dart';
 import '/screens/splash_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await printVersion();
   runApp(const StaffAttendanceApp());
 }
 

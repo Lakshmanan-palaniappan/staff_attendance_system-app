@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
 import '../services/api_service.dart';
 import 'attendance_home.dart';
+import '../services/version_service.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -109,9 +110,13 @@ class _LoginScreenState extends State<LoginScreen> {
       final usernameClean =
       _usernameController.text.trim().replaceAll(" ", "");
 
+      // NEW: get current app version
+      final appVersion = await VersionService.getCurrentVersion();
+
       final res = await ApiService.loginRequest(
         usernameClean,
         _passwordController.text.trim(),
+        appVersion, // send version
       );
 
       pendingStaffId = int.tryParse(res["staffId"].toString());
@@ -125,13 +130,27 @@ class _LoginScreenState extends State<LoginScreen> {
       _startPolling();
     } catch (e) {
       final msg = _cleanError(e);
-      await _vibrate(error: true);
-      _snack(msg, error: true);
-      setState(() => status = msg);
+
+      // If backend signalled outdated app
+      if (msg.contains("OUTDATED_APP") ||
+          msg.toLowerCase().contains("outdated")) {
+        _snack(
+          "Your app is outdated. Please update from Play Store / latest APK.",
+          error: true,
+        );
+        setState(() {
+          status = "App version is outdated. Please update.";
+        });
+      } else {
+        await _vibrate(error: true);
+        _snack(msg, error: true);
+        setState(() => status = msg);
+      }
     } finally {
       setState(() => isLoading = false);
     }
   }
+
 
   // -----------------------------------------------------------
   // UI

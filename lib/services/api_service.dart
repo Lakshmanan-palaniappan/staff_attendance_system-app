@@ -3,16 +3,63 @@ import 'package:http/http.dart' as http;
 
 const String backendBaseUrl = "http://103.207.1.87:3030";
 
+/// --------- MODELS FOR ATTENDANCE STATUS ---------
+class EmpStatus {
+  final String? empName;
+  final String? department;
+  final bool attdCompleted;
+  final bool semPlanCompleted;
+
+  EmpStatus({
+    this.empName,
+    this.department,
+    required this.attdCompleted,
+    required this.semPlanCompleted,
+  });
+
+  factory EmpStatus.fromJson(Map<String, dynamic> json) {
+    return EmpStatus(
+      empName: json['empName'] as String?,
+      department: json['department'] as String?,
+      attdCompleted: (json['attdCompleted'] ?? false) as bool,
+      semPlanCompleted: (json['semPlanCompleted'] ?? false) as bool,
+    );
+  }
+}
+
+class MarkAttendanceResult {
+  final bool success;              // true = 200 OK, false = error
+  final String message;            // success message or error message
+  final String? currentStatus;     // "checkin" / "checkout" (may be null on error)
+  final EmpStatus? empStatus;      // null if not returned
+  final List<String> pendingTasks; // only on error (or empty)
+  final int cooldownMinutesLeft;   // minutes remaining before next allowed check-in
+
+  MarkAttendanceResult({
+    required this.success,
+    required this.message,
+    this.currentStatus,
+    this.empStatus,
+    this.pendingTasks = const [],
+    this.cooldownMinutesLeft = 0,
+  });
+}
+
+/// --------- API SERVICE ---------
 class ApiService {
   /// POST /auth/login-request
   static Future<Map<String, dynamic>> loginRequest(
-      String username, String password) async {
+      String username,
+      String password,
+      String appVersion,
+      ) async {
     final res = await http.post(
       Uri.parse("$backendBaseUrl/auth/login-request"),
       headers: {"Content-Type": "application/json"},
       body: jsonEncode({
         "usernameOrId": username.trim(),
         "password": password.trim(),
+        "appVersion": appVersion.trim(), // NEW
       }),
     );
     return _handleResponse(res);
@@ -30,8 +77,14 @@ class ApiService {
   }
 
   /// POST /attendance/mark
-  static Future<Map<String, dynamic>> markAttendance(
-      int staffId, double lat, double lng) async {
+  ///
+  /// NOTE: this does NOT use _handleResponse because we want
+  /// to keep error body (pendingTasks, empStatus, cooldown) instead of throwing.
+  static Future<MarkAttendanceResult> markAttendance(
+      int staffId,
+      double lat,
+      double lng,
+      ) async {
     final res = await http.post(
       Uri.parse("$backendBaseUrl/attendance/mark"),
       headers: {"Content-Type": "application/json"},
@@ -41,7 +94,67 @@ class ApiService {
         "lng": lng,
       }),
     );
-    return _handleResponse(res);
+
+    Map<String, dynamic> data = {};
+    try {
+      data = jsonDecode(res.body) as Map<String, dynamic>;
+    } catch (_) {
+      // if parse fails, treat as generic error
+      return MarkAttendanceResult(
+        success: false,
+        message: "Unexpected server response",
+        currentStatus: null,
+        empStatus: null,
+        pendingTasks: const [],
+        cooldownMinutesLeft: 0,
+      );
+    }
+
+    // Try to read cooldown from multiple possible keys, default 0
+    int _parseCooldown(dynamic raw) {
+      if (raw == null) return 0;
+      if (raw is int) return raw;
+      if (raw is double) return raw.toInt();
+      return int.tryParse(raw.toString()) ?? 0;
+    }
+
+    final int cooldown = _parseCooldown(
+      data['cooldownMinutesLeft'] ?? data['cooldown'] ?? data['cooldownMinutes'],
+    );
+
+    if (res.statusCode == 200) {
+      // SUCCESS → checkin / checkout
+      final empJson = data['empStatus'];
+      final empStatus =
+      empJson is Map<String, dynamic> ? EmpStatus.fromJson(empJson) : null;
+
+      return MarkAttendanceResult(
+        success: true,
+        message: data['message']?.toString() ?? "Attendance marked",
+        currentStatus: data['currentStatus']?.toString(),
+        empStatus: empStatus,
+        pendingTasks: const [],
+        cooldownMinutesLeft: cooldown,
+      );
+    } else {
+      // ERROR → we still want pendingTasks & empStatus & cooldown
+      final List<String> pending = (data['pendingTasks'] as List? ?? [])
+          .map((e) => e.toString())
+          .toList();
+
+      final empJson = data['empStatus'];
+      final empStatus =
+      empJson is Map<String, dynamic> ? EmpStatus.fromJson(empJson) : null;
+
+      return MarkAttendanceResult(
+        success: false,
+        message: data['error']?.toString() ?? "Failed to mark attendance",
+        currentStatus: data['currentStatus']?.toString(),
+        empStatus: empStatus,
+        pendingTasks: pending,
+        cooldownMinutesLeft: cooldown,
+      );
+    }
   }
 
   /// GET /staff/attendance/today/:staffId
@@ -65,14 +178,6 @@ class ApiService {
     throw Exception(data["error"] ?? "Failed to load profile");
   }
 
-  static Map<String, dynamic> _handleResponse(http.Response res) {
-    final data = jsonDecode(res.body);
-    if (res.statusCode >= 200 && res.statusCode < 300) {
-      return Map<String, dynamic>.from(data);
-    } else {
-      throw Exception(data["error"] ?? "Something went wrong");
-    }
-  }
   /// GET /staff/attendance/pairs/:staffId
   static Future<List<dynamic>> getAttendancePairs(int staffId) async {
     final res = await http.get(
@@ -95,6 +200,34 @@ class ApiService {
     throw Exception("Failed to load full attendance");
   }
 
+  /// GET /app/latest-version
+  static Future<String> fetchLatestAppVersion() async {
+    final res = await http.get(
+      Uri.parse("$backendBaseUrl/app/latest-version"),
+      headers: {"Content-Type": "application/json"},
+    );
+
+    final data = jsonDecode(res.body);
+    if (res.statusCode == 200 && data["latestVersion"] != null) {
+      return data["latestVersion"] as String;
+    }
+    throw Exception(data["error"] ?? "Failed to get latest version");
+  }
+
+  /// generic handler for other endpoints
+  static Map<String, dynamic> _handleResponse(http.Response res) {
+    final data = jsonDecode(res.body);
+
+    // Special handling for outdated app
+    if (res.statusCode == 426) {
+      // pass errorCode so UI can detect "OUTDATED_APP"
+      throw Exception(data["errorCode"] ?? data["error"] ?? "OUTDATED_APP");
+    }
+
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return Map<String, dynamic>.from(data);
+    } else {
+      throw Exception(data["error"] ?? "Something went wrong");
+    }
+  }
 }
-
-

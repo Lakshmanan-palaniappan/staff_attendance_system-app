@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../services/api_service.dart';
 import '../widgets/attendance_toggle.dart';
@@ -25,10 +26,16 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   int? staffId;
   String displayName = "";
   String displayId = "";
+  String appVersion = "-";       // installed version (device)
+  String serverVersion = "-";    // version stored in DB for this staff
 
   List<dynamic> today = [];
   List<dynamic> pairs = [];
   List<dynamic> history = [];
+
+  // Cooldown (real-time)
+  Timer? _cooldownTimer;
+  int _cooldownMinutesLeft = 0;
 
   // Utility
   String _clean(e) => e.toString().replaceFirst("Exception:", "").trim();
@@ -55,11 +62,18 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     _initLoad();
   }
 
+  @override
+  void dispose() {
+    _cooldownTimer?.cancel();
+    super.dispose();
+  }
+
   Future<void> _initLoad() async {
     final prefs = await SharedPreferences.getInstance();
     staffId = prefs.getInt("staffId");
 
     if (staffId == null) {
+      if (!mounted) return;
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (_) => const LoginScreen()),
@@ -67,17 +81,59 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       return;
     }
 
+    await _loadAppVersion();
     await _loadProfile();
     await _refreshAll();
+    await _autoMarkOnStart();
+  }
+
+  Future<void> _loadAppVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      setState(() {
+        appVersion = info.version;
+      });
+    } catch (_) {
+      // ignore, keep "-"
+    }
+  }
+
+  Future<void> _autoMarkOnStart() async {
+    try {
+      LocationPermission perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied) return;
+
+      final pos = await Geolocator.getCurrentPosition();
+
+      final result = await ApiService.markAttendance(
+        staffId!,
+        pos.latitude,
+        pos.longitude,
+      );
+
+      if (result.success && result.message.isNotEmpty) {
+        _snack(result.message);
+      }
+
+      await _refreshAll();
+    } catch (e) {
+      // silently ignore for UX
+    }
   }
 
   Future<void> _loadProfile() async {
     try {
       final data = await ApiService.getMyProfile(staffId!);
+      debugPrint("PROFILE: $data");
 
       setState(() {
-        displayName = data["username"] ?? "Staff";
+        displayName =
+            (data["name"] ?? data["username"] ?? "Staff").toString();
         displayId = (data["staffId"] ?? "").toString();
+        serverVersion = data["serverAppVersion"]?.toString() ?? "-";
       });
     } catch (e) {
       _snack(_clean(e), error: true);
@@ -96,14 +152,35 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       today = await ApiService.getTodayAttendance(staffId!);
 
       if (today.isNotEmpty) {
-        isCheckedIn = today.first["CheckType"].toLowerCase() == "checkin";
-        status = isCheckedIn ? "Checked In" : "Not Checked In";
+        // backend orders DESC, so first = latest
+        final lastType =
+        today.first["CheckType"].toString().toLowerCase();
+
+        if (lastType == "checkin") {
+          isCheckedIn = true;
+          status = "Checked In";
+        } else if (lastType == "checkout") {
+          isCheckedIn = false;
+          status = "Checked Out";
+        } else {
+          isCheckedIn = false;
+          status = "Status Unknown";
+        }
+
+        final last = today.last;
+        try {
+          final dt = DateTime.parse(last["Timestamp"].toString());
+          lastUpdated = TimeOfDay.fromDateTime(dt).format(context);
+        } catch (_) {
+          lastUpdated = "-";
+        }
       } else {
         isCheckedIn = false;
         status = "No check-in yet";
+        lastUpdated = "-";
       }
 
-      setState(() {});
+      if (mounted) setState(() {});
     } catch (e) {
       _snack(_clean(e), error: true);
     }
@@ -113,7 +190,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   Future<void> _loadPairs() async {
     try {
       pairs = await ApiService.getAttendancePairs(staffId!);
-      setState(() {});
+      if (mounted) setState(() {});
     } catch (e) {
       _snack(_clean(e), error: true);
     }
@@ -123,13 +200,229 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   Future<void> _loadHistory() async {
     try {
       history = await ApiService.getAttendanceAll(staffId!);
-      setState(() {});
+      if (mounted) setState(() {});
     } catch (e) {
       _snack(_clean(e), error: true);
     }
   }
 
-  // ========================== MARK ATTENDANCE ==========================
+  // ========================== COOLDOWN TIMER ==========================
+  void _startCooldownTimer(int minutes) {
+    _cooldownTimer?.cancel();
+
+    if (minutes <= 0) {
+      setState(() {
+        _cooldownMinutesLeft = 0;
+      });
+      return;
+    }
+
+    final end = DateTime.now().add(Duration(minutes: minutes));
+
+    setState(() {
+      _cooldownMinutesLeft = minutes;
+    });
+
+    _cooldownTimer = Timer.periodic(const Duration(seconds: 30), (t) {
+      final diff = end.difference(DateTime.now());
+      final m = diff.inMinutes;
+
+      if (m <= 0) {
+        t.cancel();
+        if (mounted) {
+          setState(() {
+            _cooldownMinutesLeft = 0;
+          });
+        }
+      } else {
+        if (mounted) {
+          // +1 so user sees e.g. 5,4,3,2,1 instead of jumping early to 0
+          setState(() {
+            _cooldownMinutesLeft = m + 1;
+          });
+        }
+      }
+    });
+  }
+
+  // ========================== STATUS SHEET FOR EMP WORK FLAGS ==========================
+  void _showEmpStatusSheet(MarkAttendanceResult result, {bool isError = false}) {
+    final emp = result.empStatus;
+    final pending = result.pendingTasks;
+
+    // Use dynamic cooldown from state if available, else fallback to API value
+    final int cooldown = _cooldownMinutesLeft > 0
+        ? _cooldownMinutesLeft
+        : result.cooldownMinutesLeft;
+
+    final bool attdOk = emp?.attdCompleted ?? false;
+    final bool semOk = emp?.semPlanCompleted ?? false;
+
+    final bool hasPending = !attdOk || !semOk || pending.isNotEmpty;
+    final bool isCooldownOnly = cooldown > 0 && !hasPending;
+    final bool allWorkOk = !hasPending;
+
+    IconData icon;
+    Color color;
+    String titleText;
+
+    if (isCooldownOnly) {
+      icon = Icons.info;
+      color = Colors.blue;
+      titleText = "Work status: All clear (cooldown)";
+    } else if (allWorkOk) {
+      icon = Icons.check_circle;
+      color = Colors.green;
+      titleText = "Work status: All clear";
+    } else {
+      icon = Icons.warning_amber_rounded;
+      color = Colors.orange;
+      titleText = "Work status: Pending items";
+    }
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.only(
+                top: 16,
+                left: 16,
+                right: 16,
+                bottom: 24,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // ---------- HEADER ----------
+                  Row(
+                    children: [
+                      Icon(icon, color: color),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          titleText,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => Navigator.pop(ctx),
+                      )
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+
+                  // ---------- EMP BASIC INFO ----------
+                  if (emp != null) ...[
+                    if (emp.empName != null)
+                      Text(
+                        emp.empName!,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    if (emp.department != null)
+                      Text(
+                        emp.department!,
+                        style: const TextStyle(color: Colors.grey),
+                      ),
+                    const SizedBox(height: 10),
+
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        Chip(
+                          avatar: Icon(
+                            attdOk ? Icons.check : Icons.close,
+                            size: 18,
+                            color: Colors.white,
+                          ),
+                          label: Text(
+                            "Attendance: ${attdOk ? "Completed" : "Pending"}",
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                          backgroundColor:
+                          attdOk ? Colors.green : Colors.redAccent,
+                        ),
+                        Chip(
+                          avatar: Icon(
+                            semOk ? Icons.check : Icons.close,
+                            size: 18,
+                            color: Colors.white,
+                          ),
+                          label: Text(
+                            "Sem Plan: ${semOk ? "Completed" : "Pending"}",
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                          backgroundColor:
+                          semOk ? Colors.green : Colors.redAccent,
+                        ),
+                      ],
+                    ),
+                  ],
+
+                  // ---------- COOL DOWN INFO ----------
+                  if (cooldown > 0) ...[
+                    const SizedBox(height: 16),
+                    const Text(
+                      "Check-in cooldown",
+                      style: TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      "You have recently checked out. "
+                          "You can check in again after about $cooldown minute(s).",
+                      style: const TextStyle(color: Colors.blueGrey),
+                    ),
+                  ],
+
+                  // ---------- PENDING TASKS ----------
+                  if (pending.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    const Text(
+                      "Pending tasks:",
+                      style: TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: pending
+                          .map(
+                            (p) => Chip(
+                          label: Text(p),
+                          backgroundColor: Colors.orange.shade100,
+                        ),
+                      )
+                          .toList(),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // ========================== MARK ATTENDANCE (MANUAL) ==========================
   Future<void> _manualMark() async {
     setState(() {
       isLoading = true;
@@ -147,25 +440,80 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
       final pos = await Geolocator.getCurrentPosition();
 
-      final res = await ApiService.markAttendance(
+      final result = await ApiService.markAttendance(
         staffId!,
         pos.latitude,
         pos.longitude,
       );
 
-      status = res["message"];
-      lastUpdated = TimeOfDay.now().format(context);
+      if (result.success) {
+        // ✅ Any successful check-in/out cancels cooldown
+        _cooldownTimer?.cancel();
+        _cooldownMinutesLeft = 0;
 
-      await _refreshAll();
-      await _vibrate();
-      _snack(status);
+        final s = (result.currentStatus ?? "").toLowerCase();
+        if (s == "checkin") {
+          status = "Checked In";
+        } else if (s == "checkout") {
+          status = "Checked Out";
+        } else {
+          status = "Updated";
+        }
+
+        lastUpdated = TimeOfDay.now().format(context);
+
+        await _refreshAll();
+        await _vibrate();
+        _snack(result.message);
+
+        _showEmpStatusSheet(result, isError: false);
+      } else {
+        // ❌ ERROR / BLOCKED
+        final bool hasCooldownOnly =
+            result.cooldownMinutesLeft > 0 && result.pendingTasks.isEmpty;
+
+        if (hasCooldownOnly) {
+          // start / refresh countdown from server value
+          _startCooldownTimer(result.cooldownMinutesLeft);
+
+          // compute value to show (prefer live countdown if already ticking)
+          final int effectiveCooldown = _cooldownMinutesLeft > 0
+              ? _cooldownMinutesLeft
+              : result.cooldownMinutesLeft;
+
+          // short status line
+          status = "Cooldown: ~$effectiveCooldown min left";
+
+          await _vibrate(error: true);
+          _snack(
+            "You can check in again after about $effectiveCooldown minute(s).",
+            error: true,
+          );
+
+          // show sheet with cooldown + flags
+          _showEmpStatusSheet(result, isError: true);
+        } else {
+          // other errors (pending work etc.)
+          String shortStatus = "Action blocked";
+          if (result.pendingTasks.isNotEmpty) {
+            shortStatus = "Pending: ${result.pendingTasks.first}";
+          }
+          status = shortStatus;
+
+          await _vibrate(error: true);
+          _snack(result.message, error: true);
+          _showEmpStatusSheet(result, isError: true);
+        }
+      }
     } catch (e) {
       final msg = _clean(e);
       await _vibrate(error: true);
       _snack(msg, error: true);
-      status = msg;
+      status = "Error";
     } finally {
-      setState(() => isLoading = false);
+      if (mounted) {
+        setState(() => isLoading = false);
+      }
     }
   }
 
@@ -173,6 +521,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
 
+    if (!mounted) return;
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(builder: (_) => const LoginScreen()),
@@ -189,7 +538,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
           children: [
             UserAccountsDrawerHeader(
               accountName: Text(displayName),
-              accountEmail: Text("ID: $displayId"),
+              accountEmail: Text(
+                "Version (Device/Server): $appVersion / $serverVersion",
+              ), // only version info
               currentAccountPicture: const CircleAvatar(
                 child: Icon(Icons.person, color: Colors.white),
               ),
@@ -202,7 +553,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
           ],
         ),
       ),
-
       body: Stack(
         children: [
           Padding(
@@ -230,7 +580,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                         _workHoursCard(),
 
                         const SizedBox(height: 12),
-                        _fullHistoryList(),   // ❗ Removed Expanded here
+                        _fullHistoryList(),
                       ],
                     ),
                   ),
@@ -248,7 +598,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
             ),
         ],
       ),
-
     );
   }
 
@@ -271,13 +620,21 @@ class _AttendanceHomeState extends State<AttendanceHome> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(displayName,
-                      style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold)),
-                  Text("ID: $displayId"),
+                  Text(
+                    displayName,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                   const SizedBox(height: 6),
                   Text("Status: $status"),
                   Text("Last Updated: $lastUpdated"),
+                  if (_cooldownMinutesLeft > 0)
+                    Text(
+                      "Next check-in in ~ $_cooldownMinutesLeft min",
+                      style: const TextStyle(color: Colors.blueGrey),
+                    ),
                 ],
               ),
             ),
@@ -314,8 +671,8 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                       ? Colors.green
                       : Colors.red,
                 ),
-                title: Text(r["CheckType"].toUpperCase()),
-                subtitle: Text(r["Timestamp"]),
+                title: Text(r["CheckType"].toString().toUpperCase()),
+                subtitle: Text(r["Timestamp"].toString()),
               );
             })
           ],
@@ -324,7 +681,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     );
   }
 
-  // ======================= CARD: WORK HOURS =======================
   // ======================= CARD: WORK HOURS (With Date Chips) =======================
   Widget _workHoursCard() {
     if (pairs.isEmpty) {
@@ -338,7 +694,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       );
     }
 
-    /// 1️⃣ Group by date
     Map<String, List<dynamic>> grouped = {};
 
     for (var p in pairs) {
@@ -363,7 +718,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
             ),
             const SizedBox(height: 16),
 
-            /// 🔥 2️⃣ Chip List for all dates
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -384,7 +738,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
             const Divider(),
             const SizedBox(height: 10),
 
-            /// 🔥 3️⃣ Build logs for each date
             ...grouped.entries.map((entry) {
               String date = entry.key;
               List<dynamic> logs = entry.value;
@@ -431,8 +784,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const SizedBox(height: 10),
-
-                  /// 🔥 DATE HEADING
                   Text(
                     date,
                     style: const TextStyle(
@@ -459,8 +810,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
             }).toList(),
 
             const SizedBox(height: 12),
-
-            /// 🔥 GRAND TOTAL
             Text(
               "GRAND TOTAL: ${grandTotal.inHours}h ${grandTotal.inMinutes % 60}m",
               style: const TextStyle(
@@ -471,8 +820,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       ),
     );
   }
-
-
 
   // ======================= FULL HISTORY LIST =======================
   Widget _fullHistoryList() {
@@ -489,7 +836,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
             const SizedBox(height: 12),
 
             SizedBox(
-              height: 300,   // 🔥 Fixed height so ListView can render safely
+              height: 300,
               child: history.isEmpty
                   ? const Center(child: Text("No history found"))
                   : ListView.builder(
@@ -505,8 +852,8 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                           ? Colors.green
                           : Colors.red,
                     ),
-                    title: Text(r["CheckType"]),
-                    subtitle: Text(r["Timestamp"]),
+                    title: Text(r["CheckType"].toString()),
+                    subtitle: Text(r["Timestamp"].toString()),
                   );
                 },
               ),
@@ -516,5 +863,4 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       ),
     );
   }
-
 }
