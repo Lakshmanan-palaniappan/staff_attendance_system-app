@@ -28,22 +28,16 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   String displayId = "";
   String appVersion = "-"; // Installed version
   String serverVersion = "-"; // Version stored in DB for this staff
-  String? department;        // Department for drawer / profile
+  String? department; // Department for drawer / profile
 
   List<dynamic> today = [];
   List<dynamic> pairs = [];
   List<dynamic> history = [];
 
-  // Cooldown (real-time)
-  Timer? _cooldownTimer;
-  int _cooldownMinutesLeft = 0;
-
   // Selected date in Work Hours card
   String? _selectedWorkDate;
 
-  // Key for persisting cooldown end-time in SharedPreferences
-  static const String _cooldownEndKey = "cooldownEndTime";
-
+  // Key to persist last check type
   static const String _lastCheckTypeKey = "lastCheckType"; // "checkin" / "checkout"
 
   // Restore last known check-in/out from storage (for smoother initial UI)
@@ -76,14 +70,11 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     if (iso == null || iso.isEmpty) return null;
     try {
       final dt = DateTime.parse(iso); // parses as UTC if has 'Z'
-      return dt.toLocal();            // convert to device local time (IST etc.)
+      return dt.toLocal(); // convert to device local time (IST etc.)
     } catch (_) {
       return null;
     }
   }
-
-  /// Return only time like "09:57 PM" from ISO string, localised.
-  // ---------- TIME HELPERS (ASSUME SERVER TIME IS LOCAL IST) ----------
 
   /// Parse ISO string like "2025-12-09T21:57:39.413Z"
   /// treating it as LOCAL time (ignore Z / timezone).
@@ -97,14 +88,14 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         s = s.substring(0, s.length - 1); // drop 'Z'
       }
 
-      // You can also strip explicit offsets if your backend ever sends them.
-      // Simple defensive cut:
-      // e.g. 2025-12-09T21:57:39+05:30 -> 2025-12-09T21:57:39
+      // Remove explicit offsets if present (e.g. +05:30 / -03:00)
       final plusIndex = s.indexOf('+', 10);
       final minusIndex = s.indexOf('-', 10);
       final tzIndex = (plusIndex == -1)
           ? minusIndex
-          : (minusIndex == -1 ? plusIndex : plusIndex < minusIndex ? plusIndex : minusIndex);
+          : (minusIndex == -1
+          ? plusIndex
+          : (plusIndex < minusIndex ? plusIndex : minusIndex));
       if (tzIndex != -1) {
         s = s.substring(0, tzIndex);
       }
@@ -135,8 +126,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
     return "$y-$m-$d $hh:$mm";
   }
-
-
 
   // Utility
   String _clean(e) => e.toString().replaceFirst("Exception:", "").trim();
@@ -170,7 +159,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   @override
   void dispose() {
-    _cooldownTimer?.cancel();
     super.dispose();
   }
 
@@ -189,11 +177,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
     await _loadAppVersion();
     await _loadProfile();
-    await _restoreCooldown();     // restore cooldown from previous app state
-    await _restoreCheckStatus();  // restore last check-in/out for smoother UI
-    await _refreshAll();          // will sync from server
+    await _restoreCheckStatus(); // restore last check-in/out for smoother UI
+    await _refreshAll(); // sync from server
     await _autoMarkOnStart();
-
   }
 
   Future<void> _loadAppVersion() async {
@@ -207,10 +193,10 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     }
   }
 
+  /// Auto first check-in of the day ONLY if there is no record yet.
   Future<void> _autoMarkOnStart() async {
     try {
-      // IMPORTANT: only auto-mark if there is NO log for today
-      // (i.e., first check-in of the day). This prevents random check-outs.
+      // only auto-mark if there is NO log for today
       if (today.isNotEmpty || isCheckedIn) {
         return;
       }
@@ -242,7 +228,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     }
   }
 
-
   Future<void> _loadProfile() async {
     try {
       final data = await ApiService.getMyProfile(staffId!);
@@ -273,28 +258,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     await _loadToday();
     await _loadPairs();
     await _loadHistory();
-  }
-
-  // ========================== RESTORE COOLDOWN FROM STORAGE ==========================
-  Future<void> _restoreCooldown() async {
-    final prefs = await SharedPreferences.getInstance();
-    final endStr = prefs.getString(_cooldownEndKey);
-
-    if (endStr == null) return;
-
-    final end = DateTime.tryParse(endStr);
-    if (end == null) {
-      await prefs.remove(_cooldownEndKey);
-      return;
-    }
-
-    final remaining = end.difference(DateTime.now()).inMinutes;
-
-    if (remaining > 0) {
-      _startCooldownTimer(remaining);
-    } else {
-      await prefs.remove(_cooldownEndKey);
-    }
   }
 
   // ========================== LOAD TODAY ==========================
@@ -346,9 +309,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     }
   }
 
-
-
-
   // ========================== LOAD WORK HOURS ==========================
   Future<void> _loadPairs() async {
     try {
@@ -383,89 +343,32 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     }
   }
 
-  // ========================== COOLDOWN TIMER (PERSISTED) ==========================
-  void _startCooldownTimer(int minutes) async {
-    _cooldownTimer?.cancel();
-
-    if (minutes <= 0) {
-      setState(() {
-        _cooldownMinutesLeft = 0;
-      });
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_cooldownEndKey);
-      return;
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    final end = DateTime.now().add(Duration(minutes: minutes));
-
-    // Save cooldown end time so it survives app restart
-    await prefs.setString(_cooldownEndKey, end.toIso8601String());
-
-    setState(() {
-      _cooldownMinutesLeft = minutes;
-    });
-
-    _cooldownTimer = Timer.periodic(const Duration(seconds: 30), (t) async {
-      final diff = end.difference(DateTime.now());
-      final m = diff.inMinutes;
-
-      if (m <= 0) {
-        t.cancel();
-        await prefs.remove(_cooldownEndKey);
-        if (mounted) {
-          setState(() {
-            _cooldownMinutesLeft = 0;
-          });
-        }
-      } else {
-        if (mounted) {
-          // +1 so user sees e.g. 5,4,3,2,1 instead of jumping early to 0
-          setState(() {
-            _cooldownMinutesLeft = m + 1;
-          });
-        }
-      }
-    });
-  }
-
   // ========================== STATUS SHEET FOR EMP WORK FLAGS ==========================
   void _showEmpStatusSheet(MarkAttendanceResult result,
       {bool isError = false}) {
     final emp = result.empStatus;
-    final pending = result.pendingTasks;
+    final pending = result.pendingTasks ?? <String>[];
 
     // sync dept from empStatus into screen state
     _applyEmpStatus(emp);
-
-    // Use dynamic cooldown from state if available, else fallback to API value
-    final int cooldown = _cooldownMinutesLeft > 0
-        ? _cooldownMinutesLeft
-        : result.cooldownMinutesLeft;
 
     final bool attdOk = emp?.attdCompleted ?? false;
     final bool semOk = emp?.semPlanCompleted ?? false;
 
     final bool hasPending = !attdOk || !semOk || pending.isNotEmpty;
-    final bool isCooldownOnly = cooldown > 0 && !hasPending;
-    final bool allWorkOk = !hasPending;
 
     IconData icon;
     Color color;
     String titleText;
 
-    if (isCooldownOnly) {
-      icon = Icons.info;
-      color = Colors.blue;
-      titleText = "Work status: All clear (cooldown)";
-    } else if (allWorkOk) {
+    if (!hasPending) {
       icon = Icons.check_circle;
       color = Colors.green;
-      titleText = "Work status: All clear";
+      titleText = "E-CAMPUS status: All clear";
     } else {
       icon = Icons.warning_amber_rounded;
       color = Colors.orange;
-      titleText = "Work status: Pending items";
+      titleText = "E-CAMPUS status: Pending items";
     }
 
     showModalBottomSheet(
@@ -563,22 +466,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                     ),
                   ],
 
-                  // ---------- COOL DOWN INFO ----------
-                  if (cooldown > 0) ...[
-                    const SizedBox(height: 16),
-                    const Text(
-                      "Check-in cooldown",
-                      style: TextStyle(
-                          fontSize: 16, fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      "You have recently checked out. "
-                          "You can check in again after about $cooldown minute(s).",
-                      style: const TextStyle(color: Colors.blueGrey),
-                    ),
-                  ],
-
                   // ---------- PENDING TASKS ----------
                   if (pending.isNotEmpty) ...[
                     const SizedBox(height: 16),
@@ -637,13 +524,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       // sync empStatus (for department) from this call
       _applyEmpStatus(result.empStatus);
 
-      if (result.success) {
-        // ✅ Any successful check-in/out cancels cooldown and clears storage
-        _cooldownTimer?.cancel();
-        _cooldownMinutesLeft = 0;
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.remove(_cooldownEndKey);
-
+      if (result.success == true) {
         final s = (result.currentStatus ?? "").toLowerCase();
 
         if (s == "checkin") {
@@ -665,46 +546,27 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         await _vibrate();
         _snack(result.message);
 
-        _showEmpStatusSheet(result, isError: false);
-      }
-    else {
-        final bool hasCooldownOnly =
-            result.cooldownMinutesLeft > 0 && result.pendingTasks.isEmpty;
+        // Show sheet only on success when there is something meaningful
+        if (result.empStatus != null ||
+            (result.pendingTasks?.isNotEmpty ?? false)) {
+          _showEmpStatusSheet(result, isError: false);
+        }
+      } else {
+        // Backend returned a logical failure but still gave a result
+        final msg = result.message ?? "Action blocked";
 
-        if (hasCooldownOnly) {
-          // start / refresh countdown from server value
-          _startCooldownTimer(result.cooldownMinutesLeft);
+        await _vibrate(error: true);
+        _snack(msg, error: true);
 
-          // compute value to show (prefer live countdown if already ticking)
-          final int effectiveCooldown = _cooldownMinutesLeft > 0
-              ? _cooldownMinutesLeft
-              : result.cooldownMinutesLeft;
-
-          // short status line
-          status = "Cooldown: ~$effectiveCooldown min left";
-
-          await _vibrate(error: true);
-          _snack(
-            "You can check in again after about $effectiveCooldown minute(s).",
-            error: true,
-          );
-
-          // show sheet with cooldown + flags
-          _showEmpStatusSheet(result, isError: true);
-        } else {
-          // other errors (pending work etc.)
-          String shortStatus = "Action blocked";
-          if (result.pendingTasks.isNotEmpty) {
-            shortStatus = "Pending: ${result.pendingTasks.first}";
-          }
-          status = shortStatus;
-
-          await _vibrate(error: true);
-          _snack(result.message, error: true);
+        // Only show sheet if there are actual pending items to show
+        if (result.pendingTasks != null && result.pendingTasks.isNotEmpty) {
           _showEmpStatusSheet(result, isError: true);
         }
+
+        status = msg;
       }
     } catch (e) {
+      // Network / geofence / server error thrown as exception
       final msg = _clean(e);
       await _vibrate(error: true);
       _snack(msg, error: true);
@@ -717,18 +579,37 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   }
 
   // Wrapper used by the button
-  void _handleAttendanceButton() {
-    // If in cooldown, do NOT call API – just show feedback
-    if (_cooldownMinutesLeft > 0) {
-      _vibrate(error: true);
-      _snack(
-        "You are in cooldown. You can check in again after about $_cooldownMinutesLeft minute(s).",
-        error: true,
+  void _handleAttendanceButton() async {
+    // If currently checked in, user is about to CHECK OUT → ask confirmation
+    if (isCheckedIn) {
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Confirm checkout"),
+          content: const Text(
+            "Are you sure you want to check out? "
+                "After checkout, you cannot check in again for today.",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text("Yes, checkout"),
+            ),
+          ],
+        ),
       );
-      return;
+
+      if (confirm != true) {
+        // user cancelled
+        return;
+      }
     }
 
-    // Fire async mark call
+    // For check-in OR confirmed checkout
     _manualMark();
   }
 
@@ -743,41 +624,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     );
   }
 
-  // ========================== COOLDOWN BANNER ==========================
-  Widget _cooldownBanner() {
-    if (_cooldownMinutesLeft <= 0) return const SizedBox.shrink();
-
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.orange.shade50,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.orange.shade300),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.timer, size: 22, color: Colors.orange),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              "You are in cooldown.\nNext check-in in about $_cooldownMinutesLeft minute(s).",
-              style: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   // ========================== UI ==========================
   @override
   Widget build(BuildContext context) {
-    final bool inCooldown = _cooldownMinutesLeft > 0;
-
     return Scaffold(
       appBar: AppBar(
         title: Column(
@@ -786,7 +635,8 @@ class _AttendanceHomeState extends State<AttendanceHome> {
             const Text("My Attendance"),
             Text(
               status,
-              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w400),
+              style:
+              const TextStyle(fontSize: 12, fontWeight: FontWeight.w400),
             ),
           ],
         ),
@@ -958,7 +808,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         children: [
           Column(
             children: [
-              if (inCooldown) _cooldownBanner(),
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
@@ -971,9 +820,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                         AttendanceToggle(
                           isCheckedIn: isCheckedIn,
                           isLoading: isLoading,
-                          onPressed: _cooldownMinutesLeft > 0
-                              ? null
-                              : _handleAttendanceButton,
+                          onPressed: _handleAttendanceButton,
                         ),
 
                         const SizedBox(height: 20),
@@ -1040,24 +887,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                   const SizedBox(height: 6),
                   Text("Status: $status"),
                   Text("Last Updated: $lastUpdated"),
-                  if (_cooldownMinutesLeft > 0)
-                    Container(
-                      margin: const EdgeInsets.only(top: 4),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: Colors.orange.shade50,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        "Next check-in in ~ $_cooldownMinutesLeft min",
-                        style: const TextStyle(
-                          color: Colors.orange,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
                 ],
               ),
             ),
@@ -1085,7 +914,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
             // ---- FIXED HEIGHT SCROLL VIEW ----
             SizedBox(
-              height: 180, // <-- Adjust height as needed (150 / 200 / 250)
+              height: 180, // Adjust height as needed
               child: today.isEmpty
                   ? const Center(child: Text("No records yet"))
                   : ListView.builder(
@@ -1126,7 +955,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       ),
     );
   }
-
 
   // ======================= CARD: WORK HOURS (with horizontal chips + date picker) =======================
   Widget _workHoursCard() {
@@ -1212,7 +1040,8 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       logTiles.add(
         ListTile(
           dense: true,
-          contentPadding: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
+          contentPadding:
+          const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
           leading: const Icon(Icons.access_time),
           title: Text(
             "Check-in: ${_formatDateTimeShort(row["CheckInTime"]?.toString())}",
@@ -1362,8 +1191,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     );
   }
 
-
-
   // ======================= FULL HISTORY LIST =======================
   Widget _fullHistoryList() {
     return Card(
@@ -1421,5 +1248,4 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       ),
     );
   }
-
 }
