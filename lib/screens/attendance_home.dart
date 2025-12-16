@@ -19,6 +19,8 @@ class AttendanceHome extends StatefulWidget {
 class _AttendanceHomeState extends State<AttendanceHome> {
   bool isCheckedIn = false;
   bool isLoading = false;
+  bool _isAutoMarking = false;
+
 
   String status = "Loading...";
   String lastUpdated = "-";
@@ -178,8 +180,18 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     await _loadAppVersion();
     await _loadProfile();
     await _restoreCheckStatus(); // restore last check-in/out for smoother UI
-    await _refreshAll(); // sync from server
+    await _refreshAll();
+
+    setState(() {
+      _isAutoMarking = true;
+    });
+
     await _autoMarkOnStart();
+
+    setState(() {
+      _isAutoMarking = false;
+    });
+
   }
 
   Future<void> _loadAppVersion() async {
@@ -819,9 +831,12 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
                         AttendanceToggle(
                           isCheckedIn: isCheckedIn,
-                          isLoading: isLoading,
-                          onPressed: _handleAttendanceButton,
+                          isLoading: isLoading || _isAutoMarking,
+                          onPressed: (isLoading || _isAutoMarking)
+                              ? null
+                              : _handleAttendanceButton,
                         ),
+
 
                         const SizedBox(height: 20),
                         _todaySummaryCard(),
