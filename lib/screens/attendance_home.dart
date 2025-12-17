@@ -184,13 +184,17 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
     setState(() {
       _isAutoMarking = true;
+      status = "Auto marking attendance…";
     });
 
     await _autoMarkOnStart();
 
-    setState(() {
-      _isAutoMarking = false;
-    });
+    if (mounted) {
+      setState(() {
+        _isAutoMarking = false;
+      });
+    }
+
 
   }
 
@@ -853,13 +857,26 @@ class _AttendanceHomeState extends State<AttendanceHome> {
               ),
             ],
           ),
-          if (isLoading)
+          if (isLoading || _isAutoMarking)
             Container(
               color: Colors.black26,
-              child: const Center(
-                child: CircularProgressIndicator(strokeWidth: 4),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: const [
+                  CircularProgressIndicator(strokeWidth: 4),
+                  SizedBox(height: 12),
+                  Text(
+                    "Auto marking attendance…",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
               ),
             ),
+
         ],
       ),
     );
