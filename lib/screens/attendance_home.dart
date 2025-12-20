@@ -19,7 +19,10 @@ class AttendanceHome extends StatefulWidget {
 class _AttendanceHomeState extends State<AttendanceHome> {
   bool isCheckedIn = false;
   bool isLoading = false;
-  bool _isAutoMarking = false;
+  bool _isAutoMarking = true; // lock UI until init finishes
+  bool _isStatusError = false;
+
+
 
 
   String status = "Loading...";
@@ -129,9 +132,6 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     return "$y-$m-$d $hh:$mm";
   }
 
-  // Utility
-  String _clean(e) => e.toString().replaceFirst("Exception:", "").trim();
-
   bool get _hasVersionMismatch {
     if (appVersion == "-" || serverVersion == "-") return false;
     return appVersion.trim() != serverVersion.trim();
@@ -145,13 +145,40 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   void _snack(String msg, {bool error = false}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: error ? Colors.red : Colors.green,
-      ),
-    );
+
+    final color = error ? Colors.red.shade600 : Colors.green.shade600;
+    final icon = error ? Icons.error_outline : Icons.check_circle_outline;
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.all(16),
+          duration: const Duration(seconds: 3),
+          backgroundColor: color,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          content: Row(
+            children: [
+              Icon(icon, color: Colors.white),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  msg,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
   }
+
 
   @override
   void initState() {
@@ -240,8 +267,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
       await _refreshAll();
     } catch (e) {
-      // silently ignore for UX
+      _snack(_friendlyError(e), error: true);
     }
+
   }
 
   Future<void> _loadProfile() async {
@@ -266,8 +294,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         serverVersion = data["serverAppVersion"]?.toString() ?? "-";
       });
     } catch (e) {
-      _snack(_clean(e), error: true);
+      _snack(_friendlyError(e), error: true);
     }
+
   }
 
   Future<void> _refreshAll() async {
@@ -321,8 +350,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
       if (mounted) setState(() {});
     } catch (e) {
-      _snack(_clean(e), error: true);
+      _snack(_friendlyError(e), error: true);
     }
+
   }
 
   // ========================== LOAD WORK HOURS ==========================
@@ -331,8 +361,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       pairs = await ApiService.getAttendancePairs(staffId!);
       if (mounted) setState(() {});
     } catch (e) {
-      _snack(_clean(e), error: true);
+      _snack(_friendlyError(e), error: true);
     }
+
   }
 
   // ========================== LOAD FULL HISTORY ==========================
@@ -341,8 +372,9 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       history = await ApiService.getAttendanceAll(staffId!);
       if (mounted) setState(() {});
     } catch (e) {
-      _snack(_clean(e), error: true);
+      _snack(_friendlyError(e), error: true);
     }
+
   }
 
   // ========================== APPLY EMP STATUS TO STATE ==========================
@@ -561,6 +593,10 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         await _refreshAll();
         await _vibrate();
         _snack(result.message);
+        setState(() {
+          _isStatusError = false; // ✅ back to normal
+        });
+
 
         // Show sheet only on success when there is something meaningful
         if (result.empStatus != null ||
@@ -568,35 +604,145 @@ class _AttendanceHomeState extends State<AttendanceHome> {
           _showEmpStatusSheet(result, isError: false);
         }
       } else {
-        // Backend returned a logical failure but still gave a result
         final msg = result.message ?? "Action blocked";
 
         await _vibrate(error: true);
         _snack(msg, error: true);
 
-        // Only show sheet if there are actual pending items to show
+        setState(() {
+          status = msg;
+          _isStatusError = true; // 🔴 mark as error
+        });
+
         if (result.pendingTasks != null && result.pendingTasks.isNotEmpty) {
           _showEmpStatusSheet(result, isError: true);
         }
-
-        status = msg;
       }
-    } catch (e) {
-      // Network / geofence / server error thrown as exception
-      final msg = _clean(e);
+    }catch (e) {
+      final msg = _friendlyError(e);
       await _vibrate(error: true);
       _snack(msg, error: true);
-      status = "Error";
-    } finally {
+
+      setState(() {
+        status = msg;
+        _isStatusError = true; // 🔴 error state
+      });
+    }
+    finally {
       if (mounted) {
         setState(() => isLoading = false);
       }
     }
   }
+  Future<bool> _confirmCheckIn() async {
+    final now = DateTime.now();
+    final timeStr = TimeOfDay.fromDateTime(now).format(context);
+
+    String greeting;
+    if (now.hour < 12) {
+      greeting = "Good morning";
+    } else if (now.hour < 17) {
+      greeting = "Good afternoon";
+    } else {
+      greeting = "Good evening";
+    }
+
+    return await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text("$greeting, $displayName"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text("Current time: $timeStr"),
+            const SizedBox(height: 12),
+            const Text(
+              "Do you want to mark your attendance now?",
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.red,
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Not now"),
+          ),
+
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green,
+              foregroundColor: Colors.white,
+              elevation: 2,
+              padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              textStyle: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.2,
+              ),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("Yes, mark attendance"),
+          ),
+        ],
+
+      ),
+    ) ??
+        false;
+  }
 
   // Wrapper used by the button
   void _handleAttendanceButton() async {
-    // If currently checked in, user is about to CHECK OUT → ask confirmation
+    if (_isAutoMarking || isLoading) return;
+
+    /*
+  ─────────────────────────────────────────────────────────────
+  OPTIONAL FEATURE (FUTURE USE):
+  Prevent check-in again after checkout on the same day.
+
+  Scenario:
+  - User checks in
+  - User checks out
+  - User taps attendance button again
+
+  Without this block:
+  - Check-in confirmation dialog is shown
+  - Backend rejects the request
+
+  With this block ENABLED:
+  - Action is blocked at UI level
+  - User sees a clear message immediately
+  - No backend call, no confusion
+
+  To ENABLE later:
+  → Uncomment this entire block
+  ─────────────────────────────────────────────────────────────
+  */
+
+    /*
+  if (!isCheckedIn &&
+      today.any((e) =>
+          e["CheckType"]?.toString().toLowerCase() == "checkout")) {
+    _snack(
+      "Attendance for today has already been completed.",
+      error: true,
+    );
+    return;
+  }
+  */
+
+    // ---------- CHECKOUT FLOW ----------
     if (isCheckedIn) {
       final confirm = await showDialog<bool>(
         context: context,
@@ -619,18 +765,84 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         ),
       );
 
-      if (confirm != true) {
-        // user cancelled
-        return;
-      }
+      if (confirm != true) return;
+
+      _manualMark();
+      return;
     }
 
-    // For check-in OR confirmed checkout
+    // ---------- CHECK-IN FLOW ----------
+    final allow = await _confirmCheckIn();
+    if (!allow) return;
+
     _manualMark();
   }
 
+
+
+  String _friendlyError(dynamic e) {
+    final raw = e.toString();
+    final msg = raw.toLowerCase();
+
+    // -------- TIMEOUT --------
+    if (e is TimeoutException) {
+      return "Server is taking too long to respond. Please try again.";
+    }
+
+    // -------- NETWORK --------
+    if (msg.contains("socketexception") ||
+        msg.contains("failed host lookup") ||
+        msg.contains("network is unreachable")) {
+      return "Unable to connect to server. Check your internet connection.";
+    }
+
+    // -------- SERVER DOWN --------
+    if (msg.contains("connection refused")) {
+      return "Server is currently unavailable. Please try again later.";
+    }
+
+    // -------- AUTH --------
+    if (msg.contains("401") || msg.contains("unauthorized")) {
+      return "Session expired. Please log in again.";
+    }
+
+    if (msg.contains("403")) {
+      return "You are not authorized to perform this action.";
+    }
+
+    // -------- NOT FOUND --------
+    if (msg.contains("404")) {
+      return "Requested service not found. Please try later.";
+    }
+
+    // -------- SERVER ERROR --------
+    if (msg.contains("500")) {
+      return "Server error occurred. Please try again later.";
+    }
+
+    // -------- LOCATION / PERMISSION --------
+    if (msg.contains("permission")) {
+      return "Required permission not granted.";
+    }
+
+    // -------- FALLBACK --------
+    return "Something went wrong. Please try again.";
+  }
+
+
+
   Future<void> _logout() async {
     final prefs = await SharedPreferences.getInstance();
+    final staffId = prefs.getInt("staffId");
+
+    try {
+      if (staffId != null) {
+        await ApiService.logout(staffId);
+      }
+    } catch (_) {
+      // Network failure is acceptable – local logout still proceeds
+    }
+
     await prefs.clear();
 
     if (!mounted) return;
@@ -639,6 +851,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       MaterialPageRoute(builder: (_) => const LoginScreen()),
     );
   }
+
 
   // ========================== UI ==========================
   @override
@@ -857,25 +1070,7 @@ class _AttendanceHomeState extends State<AttendanceHome> {
               ),
             ],
           ),
-          if (isLoading || _isAutoMarking)
-            Container(
-              color: Colors.black26,
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: const [
-                  CircularProgressIndicator(strokeWidth: 4),
-                  SizedBox(height: 12),
-                  Text(
-                    "Auto marking attendance…",
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ],
-              ),
-            ),
+
 
         ],
       ),
@@ -917,7 +1112,14 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                       ),
                     ),
                   const SizedBox(height: 6),
-                  Text("Status: $status"),
+                  Text(
+                    "Status: $status",
+                    style: TextStyle(
+                      color: _isStatusError ? Colors.red : Colors.green,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+
                   Text("Last Updated: $lastUpdated"),
                 ],
               ),

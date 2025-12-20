@@ -218,16 +218,57 @@ class ApiService {
   static Map<String, dynamic> _handleResponse(http.Response res) {
     final data = jsonDecode(res.body);
 
-    // Special handling for outdated app
+    // ⬆️ App update required
     if (res.statusCode == 426) {
-      // pass errorCode so UI can detect "OUTDATED_APP"
-      throw Exception(data["errorCode"] ?? data["error"] ?? "OUTDATED_APP");
+      throw Exception(
+        data["errorCode"] ??
+            data["message"] ??
+            data["error"] ??
+            "OUTDATED_APP",
+      );
     }
 
+    // 🚫 Device limit reached (EXPLICIT)
+    if (res.statusCode == 409 &&
+        data["errorCode"] == "DEVICE_LIMIT_REACHED") {
+      throw Exception("DEVICE_LIMIT_REACHED");
+    }
+
+    // ✅ Success
     if (res.statusCode >= 200 && res.statusCode < 300) {
       return Map<String, dynamic>.from(data);
-    } else {
-      throw Exception(data["error"] ?? "Something went wrong");
     }
+
+    // ⛔ Other errors
+    throw Exception(
+      data["message"] ??
+          data["error"] ??
+          "Something went wrong",
+    );
   }
+
+
+  static Future<int> fetchDeviceCount(int staffId) async {
+    final res = await http.get(
+      Uri.parse("$backendBaseUrl/auth/device-count/$staffId"),
+      headers: {"Content-Type": "application/json"},
+    );
+
+    final data = jsonDecode(res.body);
+    if (res.statusCode == 200 && data["deviceCount"] != null) {
+      return data["deviceCount"] as int;
+    }
+
+    throw Exception(data["error"] ?? "Failed to fetch device count");
+  }
+  static Future<void> logout(int staffId) async {
+    await http.post(
+      Uri.parse("$backendBaseUrl/auth/logout"),
+      headers: {"Content-Type": "application/json"},
+      body: jsonEncode({ "staffId": staffId }),
+    );
+  }
+
+
+
 }
