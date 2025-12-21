@@ -27,13 +27,19 @@ class EmpStatus {
   }
 }
 
+/// --------- ATTENDANCE RESULT MODEL ---------
 class MarkAttendanceResult {
-  final bool success;              // true = 200 OK, false = error
-  final String message;            // success message or error message
-  final String? currentStatus;     // "checkin" / "checkout" (may be null on error)
-  final EmpStatus? empStatus;      // null if not returned
-  final List<String> pendingTasks; // only on error (or empty)
-  final int cooldownMinutesLeft;   // minutes remaining before next allowed check-in
+  final bool success;
+  final String message;
+  final String? currentStatus;
+  final EmpStatus? empStatus;
+  final List<String> pendingTasks;
+
+  /// ⏱️ COOLDOWN IN SECONDS (AUTHORITATIVE)
+  final int cooldownSeconds;
+
+  /// Used when backend says already checked in
+  final bool alreadyCheckedIn;
 
   MarkAttendanceResult({
     required this.success,
@@ -41,7 +47,8 @@ class MarkAttendanceResult {
     this.currentStatus,
     this.empStatus,
     this.pendingTasks = const [],
-    this.cooldownMinutesLeft = 0,
+    this.cooldownSeconds = 0,
+    this.alreadyCheckedIn = false,
   });
 }
 
@@ -59,7 +66,7 @@ class ApiService {
       body: jsonEncode({
         "usernameOrId": username.trim(),
         "password": password.trim(),
-        "appVersion": appVersion.trim(), // NEW
+        "appVersion": appVersion.trim(),
       }),
     );
     return _handleResponse(res);
@@ -78,8 +85,9 @@ class ApiService {
 
   /// POST /attendance/mark
   ///
-  /// NOTE: this does NOT use _handleResponse because we want
-  /// to keep error body (pendingTasks, empStatus, cooldown) instead of throwing.
+  /// NOTE:
+  /// - We do NOT throw here
+  /// - We return cooldown / pendingTasks / empStatus explicitly
   static Future<MarkAttendanceResult> markAttendance(
       int staffId,
       double lat,
@@ -95,35 +103,20 @@ class ApiService {
       }),
     );
 
-    Map<String, dynamic> data = {};
+    Map<String, dynamic> data;
     try {
       data = jsonDecode(res.body) as Map<String, dynamic>;
     } catch (_) {
-      // if parse fails, treat as generic error
       return MarkAttendanceResult(
         success: false,
         message: "Unexpected server response",
-        currentStatus: null,
-        empStatus: null,
-        pendingTasks: const [],
-        cooldownMinutesLeft: 0,
       );
     }
 
-    // Try to read cooldown from multiple possible keys, default 0
-    int _parseCooldown(dynamic raw) {
-      if (raw == null) return 0;
-      if (raw is int) return raw;
-      if (raw is double) return raw.toInt();
-      return int.tryParse(raw.toString()) ?? 0;
-    }
+    final int cooldownSeconds = (data['cooldownSeconds'] ?? 0) as int;
 
-    final int cooldown = _parseCooldown(
-      data['cooldownMinutesLeft'] ?? data['cooldown'] ?? data['cooldownMinutes'],
-    );
-
+    // ---------- SUCCESS ----------
     if (res.statusCode == 200) {
-      // SUCCESS → checkin / checkout
       final empJson = data['empStatus'];
       final empStatus =
       empJson is Map<String, dynamic> ? EmpStatus.fromJson(empJson) : null;
@@ -133,28 +126,27 @@ class ApiService {
         message: data['message']?.toString() ?? "Attendance marked",
         currentStatus: data['currentStatus']?.toString(),
         empStatus: empStatus,
-        pendingTasks: const [],
-        cooldownMinutesLeft: cooldown,
-      );
-    } else {
-      // ERROR → we still want pendingTasks & empStatus & cooldown
-      final List<String> pending = (data['pendingTasks'] as List? ?? [])
-          .map((e) => e.toString())
-          .toList();
-
-      final empJson = data['empStatus'];
-      final empStatus =
-      empJson is Map<String, dynamic> ? EmpStatus.fromJson(empJson) : null;
-
-      return MarkAttendanceResult(
-        success: false,
-        message: data['error']?.toString() ?? "Failed to mark attendance",
-        currentStatus: data['currentStatus']?.toString(),
-        empStatus: empStatus,
-        pendingTasks: pending,
-        cooldownMinutesLeft: cooldown,
+        cooldownSeconds: cooldownSeconds,
+        alreadyCheckedIn: data['alreadyCheckedIn'] == true,
       );
     }
+
+    // ---------- ERROR (400 / 429 etc.) ----------
+    final List<String> pending =
+    (data['pendingTasks'] as List? ?? []).map((e) => e.toString()).toList();
+
+    final empJson = data['empStatus'];
+    final empStatus =
+    empJson is Map<String, dynamic> ? EmpStatus.fromJson(empJson) : null;
+
+    return MarkAttendanceResult(
+      success: false,
+      message: data['error']?.toString() ?? "Failed to mark attendance",
+      currentStatus: data['currentStatus']?.toString(),
+      empStatus: empStatus,
+      pendingTasks: pending,
+      cooldownSeconds: cooldownSeconds,
+    );
   }
 
   /// GET /staff/attendance/today/:staffId
@@ -184,7 +176,6 @@ class ApiService {
       Uri.parse("$backendBaseUrl/staff/attendance/pairs/$staffId"),
       headers: {"Content-Type": "application/json"},
     );
-
     if (res.statusCode == 200) return jsonDecode(res.body);
     throw Exception("Failed to load attendance pairs");
   }
@@ -195,7 +186,6 @@ class ApiService {
       Uri.parse("$backendBaseUrl/staff/attendance/all/$staffId"),
       headers: {"Content-Type": "application/json"},
     );
-
     if (res.statusCode == 200) return jsonDecode(res.body);
     throw Exception("Failed to load full attendance");
   }
@@ -214,11 +204,10 @@ class ApiService {
     throw Exception(data["error"] ?? "Failed to get latest version");
   }
 
-  /// generic handler for other endpoints
+  /// --------- GENERIC RESPONSE HANDLER ---------
   static Map<String, dynamic> _handleResponse(http.Response res) {
     final data = jsonDecode(res.body);
 
-    // ⬆️ App update required
     if (res.statusCode == 426) {
       throw Exception(
         data["errorCode"] ??
@@ -228,26 +217,21 @@ class ApiService {
       );
     }
 
-    // 🚫 Device limit reached (EXPLICIT)
     if (res.statusCode == 409 &&
         data["errorCode"] == "DEVICE_LIMIT_REACHED") {
       throw Exception("DEVICE_LIMIT_REACHED");
     }
 
-    // ✅ Success
     if (res.statusCode >= 200 && res.statusCode < 300) {
       return Map<String, dynamic>.from(data);
     }
 
-    // ⛔ Other errors
     throw Exception(
-      data["message"] ??
-          data["error"] ??
-          "Something went wrong",
+      data["message"] ?? data["error"] ?? "Something went wrong",
     );
   }
 
-
+  /// GET /auth/device-count/:staffId
   static Future<int> fetchDeviceCount(int staffId) async {
     final res = await http.get(
       Uri.parse("$backendBaseUrl/auth/device-count/$staffId"),
@@ -261,14 +245,13 @@ class ApiService {
 
     throw Exception(data["error"] ?? "Failed to fetch device count");
   }
+
+  /// POST /auth/logout
   static Future<void> logout(int staffId) async {
     await http.post(
       Uri.parse("$backendBaseUrl/auth/logout"),
       headers: {"Content-Type": "application/json"},
-      body: jsonEncode({ "staffId": staffId }),
+      body: jsonEncode({"staffId": staffId}),
     );
   }
-
-
-
 }

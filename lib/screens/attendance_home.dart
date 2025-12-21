@@ -21,6 +21,22 @@ class _AttendanceHomeState extends State<AttendanceHome> {
   bool isLoading = false;
   bool _isAutoMarking = true; // lock UI until init finishes
   bool _isStatusError = false;
+  int _cooldownSeconds = 0;
+  Timer? _cooldownTimer;
+  String? _lastActionToday; // "checkin" | "checkout"
+  bool _wasAutoCheckin = false;
+
+
+  bool _autoMarkExecuted = false;
+  bool get _hasCheckedInToday {
+    return today.any(
+          (e) => e["CheckType"]?.toString().toLowerCase() == "checkin",
+    );
+  }
+
+
+
+
 
 
 
@@ -44,6 +60,42 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   // Key to persist last check type
   static const String _lastCheckTypeKey = "lastCheckType"; // "checkin" / "checkout"
+  String _formatCooldown(int seconds) {
+    final m = seconds ~/ 60;
+    final s = seconds % 60;
+    return "${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}";
+  }
+
+
+
+  void _startCooldownTimer(int seconds) {
+    _cooldownTimer?.cancel();
+
+    setState(() {
+      _cooldownSeconds = seconds;
+    });
+
+    _cooldownTimer = Timer.periodic(
+      const Duration(seconds: 1),
+          (timer) {
+        if (!mounted) return;
+
+        if (_cooldownSeconds <= 1) {
+          timer.cancel();
+          setState(() {
+            _cooldownSeconds = 0;
+          });
+          _loadToday(); // ✅ re-sync from backend
+        }
+        else {
+          setState(() {
+            _cooldownSeconds--;
+          });
+        }
+      },
+    );
+  }
+
 
   // Restore last known check-in/out from storage (for smoother initial UI)
   Future<void> _restoreCheckStatus() async {
@@ -188,8 +240,13 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   @override
   void dispose() {
+    _cooldownTimer?.cancel();
     super.dispose();
   }
+
+
+
+
 
   Future<void> _initLoad() async {
     final prefs = await SharedPreferences.getInstance();
@@ -204,26 +261,36 @@ class _AttendanceHomeState extends State<AttendanceHome> {
       return;
     }
 
-    await _loadAppVersion();
-    await _loadProfile();
-    await _restoreCheckStatus(); // restore last check-in/out for smoother UI
-    await _refreshAll();
-
+    // 🔥 LOCK UI + LOAD FLOW FIRST
     setState(() {
       _isAutoMarking = true;
       status = "Auto marking attendance…";
     });
 
+    await _loadAppVersion();
+    await _loadProfile();
+    //await _restoreCheckStatus(); // local cache only
+
+    // 🔒 SAFE: _loadToday() will NOT override now
+    await _refreshAll();
+
+    if (_hasCheckedInToday) {
+      setState(() {
+        status = "Attendance already marked";
+      });
+    }
+
+    // 🔥 AUTO MARK (if needed)
     await _autoMarkOnStart();
 
+    // 🔓 UNLOCK UI
     if (mounted) {
       setState(() {
         _isAutoMarking = false;
       });
     }
-
-
   }
+
 
   Future<void> _loadAppVersion() async {
     try {
@@ -238,19 +305,42 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   /// Auto first check-in of the day ONLY if there is no record yet.
   Future<void> _autoMarkOnStart() async {
+    if (_autoMarkExecuted) return; // ⛔ HARD STOP
+    _autoMarkExecuted = true;
+
     try {
-      // only auto-mark if there is NO log for today
-      if (today.isNotEmpty || isCheckedIn) {
+      // STEP 1: Attendance already exists → UI only
+      // if (today.isNotEmpty) {
+      //   final latest = today.first;
+      //   final lastType = latest["CheckType"]?.toString().toLowerCase();
+      //
+      //   setState(() {
+      //     isCheckedIn = lastType == "checkin";
+      //     status = lastType == "checkin"
+      //         ? "Attendance already marked"
+      //         : "Attendance completed";
+      //     _isStatusError = false;
+      //   });
+      //
+      //   await _saveCheckStatus(lastType);
+      //   return;
+      // }
+
+      if (_hasCheckedInToday) {
         return;
       }
 
-      LocationPermission perm = await Geolocator.checkPermission();
+
+      // STEP 2: No logs → auto check-in
+      final perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
+        final p = await Geolocator.requestPermission();
+        if (p == LocationPermission.denied) return;
       }
-      if (perm == LocationPermission.denied) return;
 
       final pos = await Geolocator.getCurrentPosition();
+      _wasAutoCheckin = true;
+
 
       final result = await ApiService.markAttendance(
         staffId!,
@@ -258,19 +348,26 @@ class _AttendanceHomeState extends State<AttendanceHome> {
         pos.longitude,
       );
 
-      // apply any empStatus data (including department) from this response
-      _applyEmpStatus(result.empStatus);
-
-      if (result.success && result.message.isNotEmpty) {
-        _snack(result.message);
+      // if (result.success == true) {
+      //   setState(() {
+      //     isCheckedIn = true;
+      //     status = "Checked In (Auto)";
+      //   });
+      //
+      //   await _saveCheckStatus("checkin");
+      //   await _loadToday();
+      // }
+      if (result.success == true) {
+        await _loadToday(); // ✅ let backend decide UI
       }
-
-      await _refreshAll();
     } catch (e) {
       _snack(_friendlyError(e), error: true);
     }
-
   }
+
+
+
+
 
   Future<void> _loadProfile() async {
     try {
@@ -310,50 +407,50 @@ class _AttendanceHomeState extends State<AttendanceHome> {
     try {
       today = await ApiService.getTodayAttendance(staffId!);
 
-      if (today.isNotEmpty) {
-        // Ensure latest first (DESC by timestamp)
-        today.sort((a, b) {
-          final ta = DateTime.tryParse(a["Timestamp"].toString()) ??
-              DateTime.fromMillisecondsSinceEpoch(0);
-          final tb = DateTime.tryParse(b["Timestamp"].toString()) ??
-              DateTime.fromMillisecondsSinceEpoch(0);
-          return tb.compareTo(ta);
+      if (today.isEmpty) {
+        setState(() {
+          isCheckedIn = false;
+          _lastActionToday = null;
+          status = "No attendance marked";
+          lastUpdated = "-";
         });
-
-        final latest = today.first;
-        final lastType = latest["CheckType"].toString().toLowerCase();
-
-        if (lastType == "checkin") {
-          isCheckedIn = true;
-          status = "Checked In";
-        } else if (lastType == "checkout") {
-          isCheckedIn = false;
-          status = "Checked Out";
-        } else {
-          isCheckedIn = false;
-          status = "Status Unknown";
-        }
-
-        // Save this latest type so we can restore it quickly on next launch
-        await _saveCheckStatus(lastType);
-
-        // Use local time, nicely formatted
-        lastUpdated = _formatTimeShort(latest["Timestamp"]?.toString());
-      } else {
-        isCheckedIn = false;
-        status = "No check-in yet";
-        lastUpdated = "-";
-
-        // Clear stored status if no logs for today
-        await _saveCheckStatus(null);
+        return;
       }
 
-      if (mounted) setState(() {});
+      // Sort latest first
+      today.sort((a, b) {
+        final ta = DateTime.parse(a["Timestamp"].toString());
+        final tb = DateTime.parse(b["Timestamp"].toString());
+        return tb.compareTo(ta);
+      });
+
+      final hasCheckin = _hasCheckedInToday;
+      final latest = today.first;
+      final lastType = latest["CheckType"]?.toString().toLowerCase();
+
+      setState(() {
+        isCheckedIn = hasCheckin;
+        _lastActionToday = lastType;
+
+        if (!hasCheckin) {
+          status = "No attendance marked";
+        } else if (_wasAutoCheckin && lastType == "checkin") {
+          status = "Checked in (Auto)";
+        } else if (lastType == "checkin") {
+          status = "Checked in";
+        } else if (lastType == "checkout") {
+          status = "Checked out";
+        }
+
+        lastUpdated =
+            _formatTimeShort(latest["Timestamp"]?.toString());
+      });
     } catch (e) {
       _snack(_friendlyError(e), error: true);
     }
-
   }
+
+
 
   // ========================== LOAD WORK HOURS ==========================
   Future<void> _loadPairs() async {
@@ -547,12 +644,16 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   // ========================== MARK ATTENDANCE (MANUAL) ==========================
   Future<void> _manualMark() async {
+    _wasAutoCheckin = false;
+
     setState(() {
       isLoading = true;
       status = "Getting location…";
+      _isStatusError = false;
     });
 
     try {
+      // ---------- LOCATION ----------
       LocationPermission perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied) {
         perm = await Geolocator.requestPermission();
@@ -563,77 +664,91 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
       final pos = await Geolocator.getCurrentPosition();
 
+      // ---------- API CALL ----------
       final result = await ApiService.markAttendance(
         staffId!,
         pos.latitude,
         pos.longitude,
       );
 
-      // sync empStatus (for department) from this call
+      // ---------- SYNC EMP STATUS ----------
       _applyEmpStatus(result.empStatus);
 
+      // =====================================================
+      // 🔥 COOLDOWN (SUCCESS OR ERROR — AUTHORITATIVE)
+      // =====================================================
+      if (result.cooldownSeconds > 0) {
+        _startCooldownTimer(result.cooldownSeconds);
+
+        final min = result.cooldownSeconds ~/ 60;
+        final sec = result.cooldownSeconds % 60;
+
+        _snack(
+          "Checkout available in ${min}m ${sec}s",
+          error: true,
+        );
+
+        setState(() {
+          status = "Checkout locked";
+          _isStatusError = false;
+        });
+
+        return;
+      }
+
+      // =====================================================
+      // ✅ SUCCESS (DO NOT MUTATE STATE)
+      // =====================================================
       if (result.success == true) {
-        final s = (result.currentStatus ?? "").toLowerCase();
+        await _refreshAll(); // 🔥 backend decides UI
 
-        if (s == "checkin") {
-          isCheckedIn = true;
-          status = "Checked In";
-        } else if (s == "checkout") {
-          isCheckedIn = false;
-          status = "Checked Out";
-        } else {
-          status = "Updated";
-        }
-
-        // Persist last known status
-        await _saveCheckStatus(s);
-
-        lastUpdated = TimeOfDay.now().format(context);
-
-        await _refreshAll();
         await _vibrate();
         _snack(result.message);
-        setState(() {
-          _isStatusError = false; // ✅ back to normal
-        });
 
-
-        // Show sheet only on success when there is something meaningful
         if (result.empStatus != null ||
-            (result.pendingTasks?.isNotEmpty ?? false)) {
+            result.pendingTasks.isNotEmpty) {
           _showEmpStatusSheet(result, isError: false);
         }
-      } else {
-        final msg = result.message ?? "Action blocked";
 
-        await _vibrate(error: true);
-        _snack(msg, error: true);
-
-        setState(() {
-          status = msg;
-          _isStatusError = true; // 🔴 mark as error
-        });
-
-        if (result.pendingTasks != null && result.pendingTasks.isNotEmpty) {
-          _showEmpStatusSheet(result, isError: true);
-        }
+        return;
       }
-    }catch (e) {
+
+      // =====================================================
+      // ❌ ERROR (NON-COOLDOWN)
+      // =====================================================
+      await _vibrate(error: true);
+      _snack(result.message, error: true);
+
+      setState(() {
+        status = result.message;
+        _isStatusError = true;
+      });
+
+      if (result.pendingTasks.isNotEmpty) {
+        _showEmpStatusSheet(result, isError: true);
+      }
+
+    } catch (e) {
       final msg = _friendlyError(e);
+
       await _vibrate(error: true);
       _snack(msg, error: true);
 
       setState(() {
         status = msg;
-        _isStatusError = true; // 🔴 error state
+        _isStatusError = true;
       });
-    }
-    finally {
+    } finally {
       if (mounted) {
-        setState(() => isLoading = false);
+        setState(() {
+          isLoading = false;
+        });
       }
     }
   }
+
+
+
   Future<bool> _confirmCheckIn() async {
     final now = DateTime.now();
     final timeStr = TimeOfDay.fromDateTime(now).format(context);
@@ -704,79 +819,53 @@ class _AttendanceHomeState extends State<AttendanceHome> {
 
   // Wrapper used by the button
   void _handleAttendanceButton() async {
-    if (_isAutoMarking || isLoading) return;
+    if (isLoading || _isAutoMarking || _cooldownSeconds > 0) return;
 
-    /*
-  ─────────────────────────────────────────────────────────────
-  OPTIONAL FEATURE (FUTURE USE):
-  Prevent check-in again after checkout on the same day.
+    // 🔥 DO NOT DECIDE ACTION IN FRONTEND
+    // Always let backend decide what happens
 
-  Scenario:
-  - User checks in
-  - User checks out
-  - User taps attendance button again
+    // Only show confirmation UI based on LAST KNOWN STATE
+    final hasCheckin = _hasCheckedInToday;
 
-  Without this block:
-  - Check-in confirmation dialog is shown
-  - Backend rejects the request
+    if (hasCheckin) {
+      // CONFIRM CHECKOUT
 
-  With this block ENABLED:
-  - Action is blocked at UI level
-  - User sees a clear message immediately
-  - No backend call, no confusion
-
-  To ENABLE later:
-  → Uncomment this entire block
-  ─────────────────────────────────────────────────────────────
-  */
-
-    /*
-  if (!isCheckedIn &&
-      today.any((e) =>
-          e["CheckType"]?.toString().toLowerCase() == "checkout")) {
-    _snack(
-      "Attendance for today has already been completed.",
-      error: true,
-    );
-    return;
-  }
-  */
-
-    // ---------- CHECKOUT FLOW ----------
-    if (isCheckedIn) {
       final confirm = await showDialog<bool>(
         context: context,
+        barrierDismissible: false,
         builder: (ctx) => AlertDialog(
           title: const Text("Confirm checkout"),
-          content: const Text(
-            "Are you sure you want to check out? "
-                "After checkout, you cannot check in again for today.",
-          ),
+          content: const Text("Are you sure you want to check out?"),
           actions: [
             TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
+              onPressed: () => Navigator.pop(ctx, false),
               child: const Text("Cancel"),
             ),
             ElevatedButton(
-              onPressed: () => Navigator.of(ctx).pop(true),
+              onPressed: () => Navigator.pop(ctx, true),
               child: const Text("Yes, checkout"),
             ),
           ],
         ),
       );
 
-      if (confirm != true) return;
-
-      _manualMark();
+      if (confirm == true) {
+        await _manualMark(); // backend decides
+      }
       return;
     }
 
-    // ---------- CHECK-IN FLOW ----------
+    // ---------- CONFIRM CHECK-IN ----------
     final allow = await _confirmCheckIn();
-    if (!allow) return;
-
-    _manualMark();
+    if (allow == true) {
+      await _manualMark(); // backend decides
+    }
   }
+
+
+
+
+
 
 
 
@@ -1047,12 +1136,18 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                         const SizedBox(height: 20),
 
                         AttendanceToggle(
-                          isCheckedIn: isCheckedIn,
-                          isLoading: isLoading || _isAutoMarking,
-                          onPressed: (isLoading || _isAutoMarking)
+                          isCheckedIn: _hasCheckedInToday,
+                          isLoading: isLoading || _isAutoMarking || _cooldownSeconds > 0,
+                          cooldownSeconds: _cooldownSeconds,
+                          onPressed:
+                          (isLoading || _isAutoMarking || _cooldownSeconds > 0)
                               ? null
                               : _handleAttendanceButton,
                         ),
+
+
+
+
 
 
                         const SizedBox(height: 20),
@@ -1112,13 +1207,32 @@ class _AttendanceHomeState extends State<AttendanceHome> {
                       ),
                     ),
                   const SizedBox(height: 6),
-                  Text(
-                    "Status: $status",
-                    style: TextStyle(
-                      color: _isStatusError ? Colors.red : Colors.green,
-                      fontWeight: FontWeight.w600,
-                    ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Status: $status",
+                        style: TextStyle(
+                          color: _isStatusError ? Colors.red : Colors.green,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+
+                      // ⏱ LIVE COOLDOWN (MM:SS)
+                      if (_cooldownSeconds > 0)
+                        Text(
+                          "Checkout available in ${_formatCooldown(_cooldownSeconds)}",
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.orange,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        )
+
+
+                    ],
                   ),
+
 
                   Text("Last Updated: $lastUpdated"),
                 ],
